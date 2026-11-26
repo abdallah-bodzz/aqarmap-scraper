@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-aqarmap_scraper.py - resumable, polite scraper for Aqarmap listing pages (v3).
+aqarmap_scraper.py - resumable, polite scraper for Aqarmap listing pages (v3.1).
 
 Commands
     probe     fetch page 1 + one detail page, save raw HTML to ./samples/, run the schema canary,
@@ -18,17 +18,20 @@ Design notes
     * SQLite (WAL) is the source of truth. Every page commits, so Ctrl-C / crashes lose nothing.
     * Primary data source: the JSON the page embeds (React Server Components stream, `initialListings`).
       The HTML cards are parsed too and compared field by field; on an id mismatch the page falls back to cards.
-    * A "cycle" is one pass over a source's pages. An unfinished cycle resumes. After a complete one the next
-      `crawl` starts a fresh snapshot. A cycle only counts as complete when every expected page was fetched,
-      it saw >= 97% of the site total and >= 90% of the previous complete cycle. Only then do misses count.
+    * A "cycle" is one pass over a source's pages. A cycle that was interrupted, hit --max-pages or stopped on page
+      errors resumes. A cycle that ran to the end of the results (complete or not) is never resumed: the next
+      `crawl` starts a fresh snapshot. A cycle only counts as complete when it reached the natural end of the
+      results, had no page errors, saw >= 97% of the site total and >= 90% of the previous complete cycle.
+      Only complete cycles count misses, and a listing is delisted after N misses on N different UTC days.
+    * One writer per database file: crawl / details / reparse / validate take an OS-level lock.
     * robots.txt is fetched and enforced. There is deliberately no override flag.
     * No proxy rotation, fingerprint tricks, CAPTCHA solving, logins or phone numbers. Phone-like strings are
-      scrubbed from everything stored.
+      scrubbed from everything stored. The default User-Agent identifies this tool (set --contact).
 
 Exit codes
     0 ok | 1 error | 2 robots.txt forbids the URLs | 3 blocked | 4 missing dependency
     5 page structure changed (schema canary) | 6 export file locked/unwritable | 7 crawl ended incomplete
-    130 interrupted
+    8 database already in use by another run | 130 interrupted
 
 Requires Python 3.10+.
 """
@@ -55,20 +58,22 @@ import argparse  # noqa: E402
 import asyncio  # noqa: E402
 import csv  # noqa: E402
 import gzip  # noqa: E402
+import hashlib  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
 import math  # noqa: E402
 import os  # noqa: E402
 import random  # noqa: E402
 import re  # noqa: E402
+import secrets  # noqa: E402
 import shutil  # noqa: E402
 import sqlite3  # noqa: E402
 import statistics  # noqa: E402
 import time  # noqa: E402
 import zlib  # noqa: E402
 from collections import Counter, defaultdict  # noqa: E402
-from dataclasses import asdict, dataclass, field  # noqa: E402
-from datetime import datetime, timezone  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
 from logging.handlers import RotatingFileHandler  # noqa: E402
 from pathlib import Path  # noqa: E402
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse  # noqa: E402
@@ -77,12 +82,12 @@ import httpx  # noqa: E402
 from selectolax.lexbor import LexborHTMLParser as HTMLParser  # noqa: E402
 from selectolax.lexbor import LexborNode as Node  # noqa: E402
 
-__version__ = "3.0.0"
-SCHEMA_VERSION = 3
+__version__ = "3.1.0"
+SCHEMA_VERSION = 4
 
 DEFAULT_URL = "https://aqarmap.com.eg/en/for-rent/property-type/alexandria/"
 DEFAULT_DB = "aqarmap_alexandria_rent.db"
-DEFAULT_UA = (
+BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
@@ -92,8 +97,11 @@ MIN_SITE_COVERAGE = 0.97          # a cycle is complete only if it saw >= 97% of
 MIN_PREV_RATIO = 0.90             # ... and >= 90% of the previous complete cycle's count
 SHARED_COORD_MIN = 15             # >= this many listings on identical coordinates => probable centroid
 MAX_PAYLOAD_FAIL_STREAK = 5       # pages in a row without a usable payload before the run stops
+RESUMABLE_STOPS = ("reached --max-pages", "3 consecutive page errors")
+LOCKED_COMMANDS = {"crawl", "details", "reparse", "validate"}
 
-EXIT_OK, EXIT_ERROR, EXIT_ROBOTS, EXIT_BLOCKED, EXIT_DEPS, EXIT_STRUCTURE, EXIT_EXPORT, EXIT_INCOMPLETE = 0, 1, 2, 3, 4, 5, 6, 7
+(EXIT_OK, EXIT_ERROR, EXIT_ROBOTS, EXIT_BLOCKED, EXIT_DEPS, EXIT_STRUCTURE, EXIT_EXPORT, EXIT_INCOMPLETE,
+ EXIT_LOCKED) = 0, 1, 2, 3, 4, 5, 6, 7, 8
 
 log = logging.getLogger("aqarmap")
 
@@ -125,6 +133,10 @@ class SchemaChanged(RuntimeError):
 
 class ExportLocked(RuntimeError):
     """An export target could not be replaced (usually open in Excel on Windows)."""
+
+
+class AlreadyRunning(RuntimeError):
+    """Another process holds the lock for this database."""
 
 
 # --------------------------------------------------------------------------- small utils
@@ -186,6 +198,15 @@ def clean(v):
     if v is None or v == "" or v == "$undefined":
         return None
     return v
+
+
+def to_str(v) -> str | None:
+    v = clean(v)
+    return None if v is None else str(v)
+
+
+def _d(x) -> dict:
+    return x if isinstance(x, dict) else {}
 
 
 def page_url(base: str, n: int) -> str:
@@ -252,6 +273,54 @@ def zjson(obj) -> bytes:
 
 def unzjson(blob: bytes | None):
     return json.loads(zlib.decompress(blob).decode("utf-8")) if blob else None
+
+
+def parse_ts(s: str) -> datetime:
+    dt = datetime.fromisoformat(s)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# --------------------------------------------------------------------------- one writer per database
+class DbLock:
+    """Exclusive advisory lock next to the database file. OS-level, so it is released if the process dies."""
+
+    def __init__(self, db_path: str):
+        self.path = f"{db_path}.lock"
+        self.fh = None
+
+    def acquire(self) -> None:
+        fh = open(self.path, "a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            fh.close()
+            raise AlreadyRunning(
+                f"another aqarmap_scraper process is using this database (lock file: {self.path}). "
+                "Wait for it to finish; two overlapping runs would corrupt the cycle bookkeeping.") from e
+        self.fh = fh
+
+    def release(self) -> None:
+        if self.fh is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            self.fh.close()
+            self.fh = None
 
 
 # --------------------------------------------------------------------------- robots.txt
@@ -361,6 +430,7 @@ def type_from_title(title: str | None) -> str | None:
 # --------------------------------------------------------------------------- prices
 LISTING_HREF_RE = re.compile(r"/listing/(\d+)")
 LABELLEDBY_RE = re.compile(r"listing-(\d+)-title")
+URL_SLUG_RE = re.compile(r"/listing/\d+-(?:for-rent|for-sale)-?(.*?)/?$")
 PRICE_RE = re.compile(r"(?:EGP|جنيه|ج\.م)\W{0,4}([\d,\.]+\d)|([\d,\.]*\d)\W{0,4}(?:EGP|جنيه|ج\.م)", re.I)
 AREA_RE = re.compile(r"([\d,\.]*\d)\s*(?:m²|m2|sqm|sq\.?\s?m|م²|م2|متر)", re.I)
 BEDS_RE = re.compile(r"(\d{1,2})\s*(?:beds?|bedrooms?|br\b|غرف|غرفة)", re.I)
@@ -450,6 +520,13 @@ def _listing_id(href: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def slug_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = URL_SLUG_RE.search(urlparse(url).path)
+    return (m.group(1) or None) if m else None
+
+
 def _anchors_in(node: Node) -> list[Node]:
     out = node.css("a")
     if node.tag == "a":
@@ -490,8 +567,7 @@ def parse_card(node: Node, listing_id: int, base_url: str) -> Card:
     listing_anchors = [a for a in anchors if _listing_id(a.attributes.get("href")) == listing_id]
     href = listing_anchors[0].attributes.get("href") if listing_anchors else f"/en/listing/{listing_id}/"
     url = _abs_url(base_url, href)
-    slug_m = re.search(r"/listing/\d+-(?:for-rent|for-sale)-?(.*?)/?$", urlparse(url).path)
-    url_slug = (slug_m.group(1) or None) if slug_m else None
+    url_slug = slug_from_url(url)
 
     text_spaced = squash(node.text(separator=" ", strip=True))
     text_piped = node.text(separator=" | ", strip=True)
@@ -755,7 +831,7 @@ def parse_location(loc) -> dict:
     if not isinstance(loc, dict):
         return {}
     path = [x.strip() for x in str(loc.get("title_full_path") or "").split(" / ") if x.strip()]
-    parent = loc.get("parent") if isinstance(loc.get("parent"), dict) else {}
+    parent = _d(loc.get("parent"))
     district = path[1] if len(path) >= 2 else None
     area = path[-1] if len(path) >= 3 else None
     if len(path) == 2:
@@ -804,20 +880,39 @@ def to_int(v) -> int | None:
     return int(n) if n is not None else None
 
 
-def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.com.eg") -> tuple[dict, list[tuple]]:
+def _names(items: list) -> list[str]:
+    out: list[str] = []
+    for it in items:
+        s = ""
+        if isinstance(it, str):
+            s = it.strip()
+        elif isinstance(it, dict):
+            for k in ("title", "name", "label", "slug"):
+                v = it.get(k)
+                if isinstance(v, (str, int)) and str(v).strip():
+                    s = str(v).strip()
+                    break
+        if s and s not in out:
+            out.append(s)
+    return out
+
+
+def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.com.eg",
+              assume_period: str | None = None) -> tuple[dict, list[tuple]]:
     """Merge one payload object and one card into a listing row. Payload first, card fallback, NULL otherwise.
     Returns (row, disagreements) where each disagreement is (field, payload_value, card_value)."""
     row: dict = {}
     dis: list[tuple] = []
-    pd_ = (p or {}).get("previewDetails") or {}
-    attrs = (p or {}).get("attributes") or {}
-    user = (p or {}).get("user") or {}
+    pd_ = _d((p or {}).get("previewDetails"))
+    attrs = _d((p or {}).get("attributes"))
+    user = _d((p or {}).get("user"))
     lid = (p or {}).get("id") if p else card.id
     row["id"] = int(lid)
     row["parse_source"] = "payload" if p else "card"
     slug = clean((p or {}).get("slug"))
     row["slug"] = slug
     row["url"] = card.url if card and card.url else f"{origin}/en/listing/{lid}-{slug}/"
+    row["url_slug"] = (card.url_slug if card else None) or slug_from_url(row["url"])
     row["title"] = clean((p or {}).get("title")) or (card.title if card else None)
 
     # --- type: payload slug only. Free text is never used.
@@ -825,7 +920,7 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
     if raw_slug is None:
         ptype = type_from_title(row["title"]) if row["title"] else None
     row["property_type"], row["property_type_raw"] = ptype, raw_slug
-    row["property_type_title"] = clean(pd_.get("propertyTypeTitle"))
+    row["property_type_title"] = to_str(pd_.get("propertyTypeTitle"))
 
     # --- price
     call_req = bool((p or {}).get("isCallRequest"))
@@ -834,11 +929,15 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
         pay_price = None
     c_amt = card.price_amount if card else None
     amount = float(pay_price) if pay_price is not None else c_amt
-    period = card.price_period if card else None
-    if amount is not None and p and c_amt is not None and abs(float(pay_price or 0) - c_amt) > 0.5 and pay_price is not None:
+    if p and pay_price is not None and c_amt is not None and abs(float(pay_price) - c_amt) > 0.5:
         dis.append(("price", pay_price, c_amt))
+    period = card.price_period if card else None
+    assumed = 0
+    if amount is not None and period is None and assume_period:
+        period, assumed = assume_period, 1
     mon = monthly_equiv(amount, period)
     row.update(price_amount=amount, price_period=period, price_monthly=round(mon, 2) if mon is not None else None,
+               period_assumed=assumed,
                daily_rate=(amount if period == "day" else (card.daily_rate if card else None)),
                is_call_request=int(call_req), currency="EGP")
 
@@ -864,10 +963,9 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
         if ba is not None and card.baths is not None and ba != card.baths:
             dis.append(("baths", ba, card.baths))
 
-    row["floor"] = clean(attrs.get("floor"))
-    row["finish_type"] = clean(attrs.get("finishType"))
-    yb = clean(pd_.get("yearBuilt"))
-    row["year_built"] = str(yb) if yb is not None else None
+    row["floor"] = to_str(attrs.get("floor"))
+    row["finish_type"] = to_str(attrs.get("finishType"))
+    row["year_built"] = to_str(pd_.get("yearBuilt"))
     vc = clean(pd_.get("propertyView"))
     row["view_code"] = to_int(vc) if vc is not None else None
 
@@ -875,8 +973,8 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
     loc = parse_location((p or {}).get("location"))
     row["district"] = loc.get("district") or (card.district if card else None)
     row["area_name"] = loc.get("area_name") or (card.area_name if card else None)
-    row["district_id"], row["area_id"] = loc.get("district_id"), loc.get("area_id")
-    row["area_parent_id"], row["location_slug"] = loc.get("area_parent_id"), loc.get("location_slug")
+    row["district_id"], row["area_id"] = to_int(loc.get("district_id")), to_int(loc.get("area_id"))
+    row["area_parent_id"], row["location_slug"] = to_int(loc.get("area_parent_id")), to_str(loc.get("location_slug"))
     row["location"] = loc.get("location") or (card.location if card else None)
     row["in_compound"] = loc.get("in_compound")
     row["district_url"] = card.district_url if card else None
@@ -885,11 +983,11 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
     # --- advertiser: NULL = no data, never "owner"
     uid = user.get("id")
     row["advertiser_id"] = int(uid) if isinstance(uid, int) or (isinstance(uid, str) and uid.isdigit()) else None
-    row["advertiser_name"] = clean(user.get("fullName")) or (card.advertiser if card else None)
+    row["advertiser_name"] = to_str(user.get("fullName")) or (card.advertiser if card else None)
     row["card_advertiser"] = card.advertiser if card else None
     paid = user.get("has_active_logo_service") if p else None
     row["has_paid_logo"] = int(bool(paid)) if paid is not None else (int(card.advertiser is not None) if card else None)
-    row["featured_type"] = clean((p or {}).get("featuredType"))
+    row["featured_type"] = to_str((p or {}).get("featuredType"))
     row["badges"] = card.badges if card else None
 
     # --- photos
@@ -899,7 +997,7 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
     photos = [x.get("src") for x in big if isinstance(x, dict) and x.get("src")] if isinstance(big, list) else None
     row["photos"] = json.dumps(photos) if photos else None
     row["image_url"] = card.image_url if card else None
-    row["updated_at"] = clean(pd_.get("updatedAt"))
+    row["updated_at"] = to_str(pd_.get("updatedAt"))
 
     # --- fields the brief hopes might exist in the payload (taken only when really present)
     posted = _find_key(p, _POSTED_KEYS) if p else None
@@ -909,11 +1007,20 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
     lat, lng = to_num(_find_key(p, _LAT_KEYS)) if p else None, to_num(_find_key(p, _LNG_KEYS)) if p else None
     row["lat"], row["lng"] = (lat, lng) if in_bbox(lat, lng) else (None, None)
     row["payment_method"] = to_int((p or {}).get("payment_method"))
-    row["payment_method_label"] = clean(pd_.get("paymentMethodLabel"))
+    row["payment_method_label"] = to_str(pd_.get("paymentMethodLabel"))
     plans = (p or {}).get("payment_plans")
     row["payment_duration"] = to_int(plans[0].get("duration")) if isinstance(plans, list) and plans and isinstance(plans[0], dict) else None
-    row["category"] = clean((p or {}).get("category"))
+    row["category"] = to_str((p or {}).get("category"))
     row["has_map"] = int(bool(pd_.get("hasMap"))) if "hasMap" in pd_ else None
+
+    # --- description / amenities: only when the payload really carries them (NULL otherwise)
+    desc = next((clean(c) for c in ((p or {}).get("description"), pd_.get("description"))
+                 if isinstance(clean(c), str) and clean(c).strip()), None)
+    row["description"] = scrub_phones(desc.strip())[:30000] if desc else None
+    am = next((c for c in ((p or {}).get("amenities"), pd_.get("amenities"), (p or {}).get("features"))
+               if isinstance(c, list) and c), None)
+    names = _names(am) if am else []
+    row["amenities"] = json.dumps(names, ensure_ascii=False) if names else None
 
     row["card_text"] = card.card_text if card else None
     row["card_html"] = zlib.compress(card.card_html.encode("utf-8"), 6) if card else None
@@ -935,7 +1042,7 @@ class PageParse:
     notes: list[str] = field(default_factory=list)
 
 
-def parse_page(html: str, url: str) -> PageParse:
+def parse_page(html: str, url: str, assume_period: str | None = None) -> PageParse:
     """Pure function: one list page -> merged rows plus every cross-check result."""
     origin = "{0.scheme}://{0.netloc}".format(urlparse(url))
     pr = parse_listing_page(html, url)
@@ -969,7 +1076,7 @@ def parse_page(html: str, url: str) -> PageParse:
     rows, dis = [], []
     by_id = {p["id"]: p for p in payload.listings} if use_payload else {}
     for c in pr.cards:
-        r, d = build_row(by_id.get(c.id), c, origin)
+        r, d = build_row(by_id.get(c.id), c, origin, assume_period)
         rows.append(r)
         dis.extend((c.id, f, pv, cv) for f, pv, cv in d)
     return PageParse(rows=rows, disagreements=dis, total=total, cards=pr.cards, payload=payload, ld=ld,
@@ -1035,6 +1142,7 @@ DETAIL_LABELS: dict[str, list[str]] = {
 _ALL_LABELS = {s for syns in DETAIL_LABELS.values() for s in syns} | {"reception", "reception rooms", "listing id", "property id"}
 _DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y")
 _SIMILAR_RE = re.compile(r"similar|related|recommend|you may also|more listings|people also", re.I)
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 
 
 def norm_label(s: str) -> str:
@@ -1089,7 +1197,8 @@ def _drop_similar_sections(doc: HTMLParser) -> None:
 
 def parse_detail(html: str, url: str) -> dict:
     """Detail page -> detail_* values only. Photos are deliberately NOT read from here (the payload has them at
-    `large` size; this page also carries 'similar listings' thumbnails). 'Similar' sections are removed first."""
+    `large` size; this page also carries 'similar listings' thumbnails). 'Similar' sections are removed first.
+    The posting date is read from the first <time datetime> in <main> (the layout has no 'Posted:' label)."""
     doc = HTMLParser(html)
     out: dict = {}
     h1 = doc.css_first("h1")
@@ -1123,6 +1232,14 @@ def parse_detail(html: str, url: str) -> dict:
 
     _drop_similar_sections(doc)
     root = doc.css_first("main") or doc.body or doc
+
+    posted_iso = None
+    tnode = root.css_first("time[datetime]")
+    if tnode is not None:
+        m = _ISO_DATE_RE.match((tnode.attributes.get("datetime") or "").strip())
+        if m:
+            posted_iso = m.group(0)
+
     pairs: dict[str, str] = {}
     for tr in root.css("tr"):
         cells = [squash(c.text(strip=True)) for c in tr.css("th,td")]
@@ -1146,6 +1263,8 @@ def parse_detail(html: str, url: str) -> dict:
     for k, v in pairs_from_lines(lines).items():
         pairs.setdefault(k, v)
     out.update(map_detail_pairs(pairs))
+    if posted_iso:
+        out["detail_posted_date"] = posted_iso   # explicit machine-readable value beats label text
     out["detail_attrs_json"] = json.dumps(pairs, ensure_ascii=False) if pairs else None
     out["detail_text"] = scrub_phones("\n".join(lines)[:60_000])
     return out
@@ -1180,6 +1299,7 @@ LISTING_COLS: list[tuple[str, str]] = [
     ("title", "TEXT"),
     ("property_type", "TEXT"), ("property_type_raw", "TEXT"), ("property_type_title", "TEXT"),
     ("price_amount", "REAL"), ("price_period", "TEXT"), ("price_monthly", "REAL"), ("daily_rate", "REAL"),
+    ("period_assumed", "INTEGER"),
     ("is_call_request", "INTEGER"), ("currency", "TEXT DEFAULT 'EGP'"),
     ("area_sqm", "REAL"), ("beds", "INTEGER"), ("baths", "INTEGER"), ("beds_raw", "TEXT"), ("baths_raw", "TEXT"),
     ("floor", "TEXT"), ("finish_type", "TEXT"), ("year_built", "TEXT"), ("view_code", "INTEGER"),
@@ -1191,7 +1311,8 @@ LISTING_COLS: list[tuple[str, str]] = [
     ("photo_count", "INTEGER"), ("photos", "TEXT"), ("image_url", "TEXT"),
     ("updated_at", "TEXT"), ("posted_date", "TEXT"), ("furnished", "TEXT"), ("lat", "REAL"), ("lng", "REAL"),
     ("payment_method", "INTEGER"), ("payment_method_label", "TEXT"), ("payment_duration", "INTEGER"),
-    ("category", "TEXT"), ("has_map", "INTEGER"), ("parse_source", "TEXT"),
+    ("category", "TEXT"), ("has_map", "INTEGER"), ("description", "TEXT"), ("amenities", "TEXT"),
+    ("parse_source", "TEXT"),
     ("card_text", "TEXT"), ("card_html", "BLOB"), ("raw_json", "BLOB"),
     ("source", "TEXT"), ("page", "INTEGER"),
     ("first_seen", "TEXT"), ("last_seen", "TEXT"), ("first_seen_run", "INTEGER"), ("last_seen_run", "INTEGER"),
@@ -1223,7 +1344,7 @@ OTHER_TABLES: dict[str, list[tuple[str, str]]] = {
 }
 STATIC_INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS ux_pages ON pages(source, page);
-CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pages ON raw_pages(source, page);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pages_run ON raw_pages(run_id, source, page);
 CREATE INDEX IF NOT EXISTS idx_price_history_id ON price_history(id);
 CREATE INDEX IF NOT EXISTS idx_disagreements_run ON disagreements(run_id);
 CREATE INDEX IF NOT EXISTS idx_listings_active ON listings(active, detail_status);
@@ -1232,17 +1353,18 @@ CREATE INDEX IF NOT EXISTS idx_listings_source_run ON listings(source, last_seen
 
 # columns rewritten on every sighting / reparse. Crawl-state and detail_* columns are never in this list.
 PARSE_COLS = [
-    "url", "slug", "title", "property_type", "property_type_raw", "property_type_title", "price_amount",
-    "price_period", "price_monthly", "daily_rate", "is_call_request", "currency", "area_sqm", "beds", "baths",
-    "beds_raw", "baths_raw", "floor", "finish_type", "year_built", "view_code", "district", "area_name",
-    "district_id", "area_id", "area_parent_id", "location_slug", "location", "in_compound", "district_url",
-    "area_url", "advertiser_id", "advertiser_name", "card_advertiser", "has_paid_logo", "featured_type", "badges",
-    "photo_count", "photos", "image_url", "updated_at", "posted_date", "furnished", "lat", "lng", "payment_method",
-    "payment_method_label", "payment_duration", "category", "has_map", "parse_source", "card_text",
+    "url", "slug", "url_slug", "title", "property_type", "property_type_raw", "property_type_title", "price_amount",
+    "price_period", "price_monthly", "daily_rate", "period_assumed", "is_call_request", "currency", "area_sqm",
+    "beds", "baths", "beds_raw", "baths_raw", "floor", "finish_type", "year_built", "view_code", "district",
+    "area_name", "district_id", "area_id", "area_parent_id", "location_slug", "location", "in_compound",
+    "district_url", "area_url", "advertiser_id", "advertiser_name", "card_advertiser", "has_paid_logo",
+    "featured_type", "badges", "photo_count", "photos", "image_url", "updated_at", "posted_date", "furnished",
+    "lat", "lng", "payment_method", "payment_method_label", "payment_duration", "category", "has_map",
+    "description", "amenities", "parse_source", "card_text",
 ]
 _BLOB_PARSE = ("card_html", "raw_json")   # kept when the new sighting has none (card-only page keeps old raw_json)
 
-# v2 -> v3 explicit column renames (the v2 detail fields now live under detail_*)
+# explicit column renames from older schema versions
 _V2_RENAMES = {
     "listings": [("advertiser", "card_advertiser"), ("floor", "detail_floor"), ("view", "detail_view"),
                  ("year_built", "detail_year_built"), ("finishing", "detail_finishing"),
@@ -1321,7 +1443,11 @@ class DB:
             log.warning("v2 property_type values were cleared (they came from seller-written titles). "
                         "Run a fresh `crawl` to fill them from the payload.")
 
-    MIGRATIONS = {2: _migrate_2_to_3}   # key = version being migrated FROM
+    def _migrate_3_to_4(self) -> None:
+        # raw_pages is now keyed by (run_id, source, page) so the previous cycle's pages survive a new cycle.
+        self.conn.execute("DROP INDEX IF EXISTS ux_raw_pages")
+
+    MIGRATIONS = {2: _migrate_2_to_3, 3: _migrate_3_to_4}   # key = version being migrated FROM
 
     def _init_schema(self) -> None:
         tables = self._tables()
@@ -1378,52 +1504,68 @@ class DB:
         self.conn.execute(f"UPDATE runs SET {sets} WHERE id=?", [*fields.values(), run_id])
         self.conn.commit()
 
-    def begin_cycle(self, source: str, fresh: bool, keep_raw: int = 1) -> tuple[int, bool]:
-        """Resume the latest unfinished crawl cycle for `source`, or start a new snapshot cycle."""
+    def begin_cycle(self, source: str, fresh: bool) -> tuple[int, bool]:
+        """Resume the latest crawl cycle for `source` only if it was cut short (interrupted, crashed, --max-pages,
+        repeated page errors). A cycle that reached the end of the results is never resumed, complete or not: it
+        starts a new snapshot instead. Raw pages of the previous cycle are kept for `reparse`."""
         row = self.conn.execute("SELECT * FROM runs WHERE kind='crawl' AND source=? ORDER BY id DESC LIMIT 1",
                                 (source,)).fetchone()
-        if row and not row["complete"] and row["status"] != "finished_complete" and not fresh \
-                and not (row["status"] == "finished" and row["stopped_reason"] and "max-pages" not in row["stopped_reason"]
-                         and row["complete"] == 0 and row["ended_at"] and False):
+        resume = False
+        if row and not fresh and not row["complete"]:
+            if row["status"] in ("running", "interrupted"):
+                resume = True
+            elif row["status"] == "finished" and (row["stopped_reason"] or "").startswith(RESUMABLE_STOPS):
+                resume = True
+        if resume:
             self.conn.execute("UPDATE runs SET status='running', ended_at=NULL WHERE id=?", (row["id"],))
             self.conn.commit()
             return row["id"], True
         self.conn.execute("DELETE FROM pages WHERE source=?", (source,))
-        self.conn.execute("DELETE FROM raw_pages WHERE source=?", (source,))
+        keep = row["id"] if row else -1
+        self.conn.execute("DELETE FROM raw_pages WHERE source=? AND COALESCE(run_id,-2)!=?", (source, keep))
         return self.new_run("crawl", source), False
 
-    def finalize_cycle(self, source: str, run_id: int, natural_end: bool, site_total: int | None, expected_pages: int | None,
-                       delist_after: int, allow_delist: bool) -> dict:
+    def finalize_cycle(self, source: str, run_id: int, natural_end: bool, site_total: int | None,
+                       expected_pages: int | None, delist_after: int, allow_delist: bool) -> dict:
         seen = self.conn.execute("SELECT COUNT(*) FROM listings WHERE last_seen_run=?", (run_id,)).fetchone()[0]
         errors = self.conn.execute("SELECT COUNT(*) FROM pages WHERE source=? AND status='error'", (source,)).fetchone()[0]
         ok_pages = self.conn.execute("SELECT COUNT(*) FROM pages WHERE source=? AND status='ok'", (source,)).fetchone()[0]
         prev = self.conn.execute("SELECT seen FROM runs WHERE kind='crawl' AND source=? AND complete=1 AND id<? "
                                  "ORDER BY id DESC LIMIT 1", (source, run_id)).fetchone()
         prev_seen = prev["seen"] if prev and prev["seen"] else None
-        reasons = []
+        reasons: list[str] = []
+        notes: list[str] = []
         if not natural_end:
             reasons.append("cycle did not reach the natural end of results")
         if errors:
             reasons.append(f"{errors} page error(s)")
-        if expected_pages is not None and ok_pages < expected_pages:
-            reasons.append(f"fetched {ok_pages} of {expected_pages} expected pages")
         if site_total and seen < MIN_SITE_COVERAGE * site_total:
             reasons.append(f"saw {seen} of {site_total} ({100 * seen / site_total:.1f}%), need >= {MIN_SITE_COVERAGE:.0%}")
         if prev_seen and seen < MIN_PREV_RATIO * prev_seen:
             reasons.append(f"saw {seen}, only {100 * seen / prev_seen:.0f}% of the previous complete cycle ({prev_seen})")
         complete = not reasons
         delisted = 0
+        counted = False
         if complete and allow_delist:
-            self.conn.execute("UPDATE listings SET missed_runs=missed_runs+1 WHERE source=? AND active=1 "
-                              "AND (last_seen_run IS NULL OR last_seen_run!=?)", (source, run_id))
+            # one miss per UTC day: back-to-back passes cannot delist anything on their own
+            today = datetime.now(timezone.utc).date().isoformat()
+            key = f"miss_day:{source}"
+            if self.meta_get(key) != today:
+                self.conn.execute("UPDATE listings SET missed_runs=missed_runs+1 WHERE source=? AND active=1 "
+                                  "AND (last_seen_run IS NULL OR last_seen_run!=?)", (source, run_id))
+                self.meta_set(key, today)
+                counted = True
+            else:
+                notes.append("misses already counted today (one per UTC day); no new miss recorded")
             cur = self.conn.execute("UPDATE listings SET active=0, delisted_run=? WHERE source=? AND active=1 "
                                     "AND missed_runs>=?", (run_id, source, delist_after))
             delisted = cur.rowcount
         elif complete:
-            reasons.append("delisting skipped: multi-source (sharded) run")
+            notes.append("delisting skipped: multi-source (sharded) run")
         self.conn.commit()
         return {"complete": complete, "seen": seen, "delisted": delisted, "page_errors": errors, "ok_pages": ok_pages,
-                "expected_pages": expected_pages, "prev_complete_seen": prev_seen, "incomplete_reasons": reasons}
+                "expected_pages": expected_pages, "prev_complete_seen": prev_seen, "incomplete_reasons": reasons,
+                "notes": notes, "miss_counted": counted}
 
     # -- pages
     def page_row(self, source: str, page: int):
@@ -1445,7 +1587,7 @@ class DB:
     def save_raw_page(self, source: str, page: int, run_id: int, html: str):
         blob = gzip.compress(scrub_phones(html).encode("utf-8"), 6)
         self.conn.execute("INSERT INTO raw_pages(source,page,run_id,fetched_at,html) VALUES(?,?,?,?,?) "
-                          "ON CONFLICT(source,page) DO UPDATE SET run_id=excluded.run_id,fetched_at=excluded.fetched_at,"
+                          "ON CONFLICT(run_id,source,page) DO UPDATE SET fetched_at=excluded.fetched_at,"
                           "html=excluded.html", (source, page, run_id, now_iso(), blob))
 
     # -- listings
@@ -1467,17 +1609,21 @@ class DB:
             d.update(source=source, page=page, first_seen=ts, last_seen=ts, first_seen_run=run_id, last_seen_run=run_id,
                      active=1, missed_runs=0, delisted_run=None)
             self.conn.execute(UPSERT_LISTING, d)
-        self.conn.execute("DELETE FROM disagreements WHERE run_id=? AND id IN (%s)" % ",".join("?" * len(rows)),
-                          [run_id, *[r["id"] for r in rows]]) if rows else None
+        if rows:
+            self.conn.execute("DELETE FROM disagreements WHERE run_id=? AND id IN (%s)" % ",".join("?" * len(rows)),
+                              [run_id, *[r["id"] for r in rows]])
         for lid, f, pv, cv in disagreements:
             self.conn.execute("INSERT INTO disagreements(run_id,id,field,payload_value,card_value) VALUES(?,?,?,?,?)",
                               (run_id, lid, f, str(pv), str(cv)))
         return new
 
     def update_parse_cols(self, r: dict, blobs: bool = False) -> None:
-        cols = PARSE_COLS + (list(_BLOB_PARSE) if blobs else [])
-        sets = ", ".join(f"{c}=?" for c in cols)
-        self.conn.execute(f"UPDATE listings SET {sets} WHERE id=?", [*[r.get(c) for c in cols], r["id"]])
+        sets = [f"{c}=?" for c in PARSE_COLS]
+        vals = [r.get(c) for c in PARSE_COLS]
+        if blobs:
+            sets += [f"{c}=COALESCE(?,{c})" for c in _BLOB_PARSE]
+            vals += [r.get(c) for c in _BLOB_PARSE]
+        self.conn.execute(f"UPDATE listings SET {', '.join(sets)} WHERE id=?", [*vals, r["id"]])
 
     def pending_detail_ids(self, limit: int | None, retry_errors: bool, redo: bool, fields: list[str] | None) -> list[tuple[int, str]]:
         if redo:
@@ -1489,6 +1635,9 @@ class DB:
         miss = {"posted_date": "posted_date IS NULL", "furnished": "furnished IS NULL",
                 "coords": "lat IS NULL", "payment": "payment_method_label IS NULL AND payment_method IS NULL"}
         if fields:
+            bad = [f for f in fields if f not in miss]
+            if bad:
+                raise SystemExit(f"unknown --fields value(s): {', '.join(bad)} (choose from {', '.join(miss)})")
             cond += " AND (" + " OR ".join(miss[f] for f in fields) + ")"
         sql = f"SELECT id,url FROM listings WHERE {cond} ORDER BY id DESC"
         if limit:
@@ -1511,7 +1660,10 @@ class DB:
         self.conn.execute(f"UPDATE listings SET {', '.join(sets)} WHERE id=?", vals)
 
     def stats(self) -> dict:
-        q = lambda sql: self.conn.execute(sql).fetchone()[0]  # noqa: E731
+        def q(sql: str, params=()):
+            return self.conn.execute(sql, params).fetchone()[0]
+        res_ph = ",".join("?" * len(RESIDENTIAL_TYPES))
+        res_params = sorted(RESIDENTIAL_TYPES)
         return {
             "listings": q("SELECT COUNT(*) FROM listings"),
             "active": q("SELECT COUNT(*) FROM listings WHERE active=1"),
@@ -1523,8 +1675,7 @@ class DB:
             "with_title": q("SELECT COUNT(*) FROM listings WHERE title IS NOT NULL"),
             "with_photo_count": q("SELECT COUNT(*) FROM listings WHERE photo_count IS NOT NULL"),
             "with_advertiser_name": q("SELECT COUNT(*) FROM listings WHERE advertiser_name IS NOT NULL"),
-            "residential": q("SELECT COUNT(*) FROM listings WHERE property_type IN (%s)" % ",".join("?" * 0) if False else
-                             "SELECT COUNT(*) FROM listings WHERE " + " OR ".join(f"property_type='{t}'" for t in sorted(RESIDENTIAL_TYPES))),
+            "residential": q(f"SELECT COUNT(*) FROM listings WHERE property_type IN ({res_ph})", res_params),
             "residential_with_beds": q("SELECT COUNT(*) FROM listings WHERE beds IS NOT NULL"),
             "residential_with_baths": q("SELECT COUNT(*) FROM listings WHERE baths IS NOT NULL"),
             "card_only_rows": q("SELECT COUNT(*) FROM listings WHERE parse_source='card'"),
@@ -1556,6 +1707,8 @@ def compute_flags(rows: list[dict]) -> dict[int, list[str]]:
                 f.append("no_price")
         else:
             p = r.get("price_period")
+            if r.get("period_assumed"):
+                f.append("assumed_period")
             if p != "month":
                 f.append({None: "unknown_price_period", "day": "daily_price", "week": "weekly_price",
                           "year": "yearly_price"}[p])
@@ -1703,7 +1856,8 @@ class HttpxFetcher:
                 ra = float(h)
             except ValueError:
                 ra = None
-        return Fetched(r.status_code, r.text, str(r.url), ra)
+        # decode explicitly: the site is UTF-8 (Arabic content), never rely on charset guessing
+        return Fetched(r.status_code, r.content.decode("utf-8", "replace"), str(r.url), ra)
 
     async def close(self):
         await self.client.aclose()
@@ -1882,7 +2036,9 @@ def payload_survey(db: DB, run_id: int) -> dict:
             "observed_values": {k: dict(c.most_common(25)) for k, c in obs.items()},
             "coordinate_keys_seen": sorted(k for k in keys if re.search(r"(^|\.)(lat|lng|lon|latitude|longitude)$", k, re.I)),
             "date_keys_seen": sorted(k for k in keys if re.search(r"(created|posted|published|date)", k, re.I)),
-            "furnished_keys_seen": sorted(k for k in keys if re.search(r"furnish", k, re.I))}
+            "furnished_keys_seen": sorted(k for k in keys if re.search(r"furnish", k, re.I)),
+            "description_keys_seen": sorted(k for k in keys if re.search(r"descri", k, re.I)),
+            "amenity_keys_seen": sorted(k for k in keys if re.search(r"amenit|feature", k, re.I))}
 
 
 def build_run_report(db: DB, run_id: int, eng: Engine | None, info: dict, site_total: int | None, stopped: str) -> dict:
@@ -1894,8 +2050,10 @@ def build_run_report(db: DB, run_id: int, eng: Engine | None, info: dict, site_t
         "SELECT * FROM listings WHERE last_seen_run=?", (run_id,))]
     n = len(seen_rows) or 1
     cov = {f: round(100 * sum(r.get(f) is not None for r in seen_rows) / n, 2)
-           for f in ("title", "price_monthly", "area_sqm", "location", "photo_count", "advertiser_name", "property_type",
-                     "advertiser_id", "finish_type", "floor", "photos", "updated_at", "posted_date", "furnished", "lat")}
+           for f in ("title", "price_monthly", "price_period", "area_sqm", "location", "photo_count", "advertiser_name",
+                     "property_type", "advertiser_id", "finish_type", "floor", "photos", "updated_at", "posted_date",
+                     "furnished", "lat", "description", "amenities")}
+    cov["period_assumed"] = round(100 * sum(1 for r in seen_rows if r.get("period_assumed")) / n, 2)
     res = [r for r in seen_rows if r.get("property_type") in RESIDENTIAL_TYPES]
     cov["beds_residential"] = round(100 * sum(r["beds"] is not None for r in res) / len(res), 2) if res else None
     cov["baths_residential"] = round(100 * sum(r["baths"] is not None for r in res) / len(res), 2) if res else None
@@ -1907,7 +2065,7 @@ def build_run_report(db: DB, run_id: int, eng: Engine | None, info: dict, site_t
     report = {
         "run_id": run_id, "script_version": __version__, "source": row["source"], "started_at": row["started_at"],
         "ended_at": now_iso(), "stopped_reason": stopped, "complete": info["complete"],
-        "incomplete_reasons": info.get("incomplete_reasons", []),
+        "incomplete_reasons": info.get("incomplete_reasons", []), "notes": info.get("notes", []),
         "site_total": site_total, "listings_seen": info["seen"], "new_listings": row["new_listings"],
         "delisted_this_run": info["delisted"], "prev_complete_seen": info.get("prev_complete_seen"),
         "pages": {"expected": info.get("expected_pages"), "ok": pg["ok"] or 0, "errors": pg["err"] or 0,
@@ -1967,12 +2125,14 @@ class Crawler:
         expected = math.ceil(total / per_page) if total and per_page else None
 
         while True:
-            limit, by_total = args.max_pages, False
-            if expected and expected + 5 < limit:
-                limit, by_total = expected + 5, True
-            if n > limit:
-                stopped = "reached expected last page" if by_total else "reached --max-pages"
-                natural = by_total
+            # `expected` (from page 1's card count) is only a sanity bound, never proof of the end of results
+            cap, cap_reason = args.max_pages, "reached --max-pages"
+            if expected:
+                soft = expected + max(5, expected // 10)
+                if soft < cap:
+                    cap, cap_reason = soft, f"passed expected last page ({expected}) without an end-of-results marker"
+            if n > cap:
+                stopped, natural = cap_reason, False
                 break
             row = db.page_row(source, n)
             if row and row["status"] == "ok" and n != 1:   # page 1 is always re-fetched: it is the schema canary
@@ -1998,7 +2158,7 @@ class Crawler:
                 n += 1
                 continue
 
-            pp = parse_page(res.text, url)
+            pp = parse_page(res.text, url, args.assume_period)
             if n == 1:
                 problems = schema_canary(pp)
                 if problems:
@@ -2022,6 +2182,11 @@ class Crawler:
                     first_query = pp.payload.query
                     db.meta_set(f"query:{source}", first_query)
                     log.info("initialQuery: %s", first_query)
+                priced = [r for r in pp.rows if r["price_amount"] is not None]
+                if priced and not args.assume_period and sum(1 for r in priced if r["price_period"]) / len(priced) < 0.5:
+                    log.warning("price period was found on < 50%% of priced cards on page 1, so price_monthly will be NULL "
+                                "for most rows. If every listing is monthly, re-run with --assume-period month "
+                                "(rows are flagged assumed_period).")
 
             for note in pp.notes:
                 log.warning("page %d: %s", n, note)
@@ -2044,7 +2209,7 @@ class Crawler:
                         log.warning("page %d empty but ~%s pages expected; re-checking (%d/2)", n, expected, k + 1)
                         await asyncio.sleep(args.backoff_base * 1.5)
                         res = await self.eng.fetch(url)
-                        pp = parse_page(res.text, url)
+                        pp = parse_page(res.text, url, args.assume_period)
                         if pp.cards:
                             break
                 if not pp.cards:
@@ -2065,6 +2230,15 @@ class Crawler:
                 natural = False
                 stopped = f"pagination wraps at page {n}"
                 break
+            if n > 2:
+                prev_row = db.page_row(source, n - 1)
+                prev_ids = set(json.loads(prev_row["ids"])) if prev_row and prev_row["ids"] else None
+                if prev_ids and set(ids) == prev_ids:
+                    db.record_page(source, n, "wrap", len(ids), ids)
+                    db.commit()
+                    natural = not (expected and n <= expected)
+                    stopped = f"page {n} repeats page {n - 1} (end of results)"
+                    break
 
             if args.save_raw:
                 db.save_raw_page(source, n, run_id, res.text)
@@ -2152,7 +2326,7 @@ class DetailRunner:
                     empty_streak = 0 if mapped else empty_streak + 1
                     if empty_streak >= 20 and not warned:
                         warned = True
-                        log.warning("20 detail pages in a row matched none of the known labels. The detail parser needs "
+                        log.warning("20 detail pages in a row matched none of the known fields. The detail parser needs "
                                     "tuning: run `probe` and send samples/detail.html.")
                 else:
                     log.error("detail %d: HTTP %d", lid, r.status)
@@ -2176,18 +2350,25 @@ class DetailRunner:
         return stats
 
 
-def detail_plan(db: DB) -> dict:
-    """The phase-4 decision numbers: which target fields the payload left empty, and the cost of fetching them."""
+def detail_plan(db: DB, rps: float) -> dict:
+    """The phase-4 decision numbers: which target fields the payload left empty, and how many requests each choice costs."""
     q = lambda sql: db.conn.execute(sql).fetchone()[0]  # noqa: E731
+    rps = max(rps, 0.01)
     act = q("SELECT COUNT(*) FROM listings WHERE active=1")
-    plan = {"active_listings": act}
-    for name, cond in (("posted_date", "posted_date IS NULL"), ("furnished", "furnished IS NULL"),
-                       ("coordinates", "lat IS NULL"), ("payment_method", "payment_method IS NULL AND payment_method_label IS NULL"),
-                       ("year_built", "year_built IS NULL"), ("floor", "floor IS NULL")):
+    plan: dict = {"active_listings": act}
+    conds = (("posted_date", "posted_date IS NULL"), ("furnished", "furnished IS NULL"),
+             ("coordinates", "lat IS NULL"), ("payment_method", "payment_method IS NULL AND payment_method_label IS NULL"),
+             ("year_built", "year_built IS NULL"), ("floor", "floor IS NULL"))
+    for name, cond in conds:
         plan[f"missing_{name}"] = q(f"SELECT COUNT(*) FROM listings WHERE active=1 AND {cond}")
+    any_missing = q("SELECT COUNT(*) FROM listings WHERE active=1 AND (posted_date IS NULL OR furnished IS NULL "
+                    "OR lat IS NULL OR (payment_method IS NULL AND payment_method_label IS NULL))")
+    pending = q("SELECT COUNT(*) FROM listings WHERE active=1 AND detail_status IS NULL")
     plan["detail_ok_so_far"] = q("SELECT COUNT(*) FROM listings WHERE detail_status='ok'")
-    plan["detail_page_cost"] = "about 357 KB per page uncompressed; at 1 req/s the full pass is act seconds " \
-                               f"(~{fmt_eta(act)}) and ~{act * 357 / 1024 / 1024:.1f} GB"
+    plan["requests_all_pending"] = pending
+    plan["eta_all_pending"] = f"{fmt_eta(pending / rps)} at {rps:g} req/s"
+    plan["requests_any_target_field_missing"] = any_missing
+    plan["eta_target_fields_only"] = f"{fmt_eta(any_missing / rps)} at {rps:g} req/s (use --fields posted_date,furnished,coords,payment)"
     return plan
 
 
@@ -2203,7 +2384,8 @@ _COLS = [
     ("price_monthly", "Price (EGP/month)", "float64", "payload price + card period",
      "Listed price normalised to EGP/month (day x30, week x52/12, year /12; see Flags)", "no price, call-for-price or unknown period"),
     ("price_amount", "Listed price", "float64", "payload price", "Price as listed, in its own period", "no price / call for price"),
-    ("price_period", "Price period", "string", "card <data> text", "month | day | week | year", "period not shown"),
+    ("price_period", "Price period", "string", "card <data> text, or --assume-period", "month | day | week | year", "period not shown and not assumed"),
+    ("period_assumed", "Period assumed", "int64", "crawl option", "1 if the period came from --assume-period rather than the page (flag assumed_period)", "never null for crawled rows"),
     ("daily_rate", "Daily rate (EGP)", "float64", "card", "Explicit per-day price shown on the listing", "no per-day price shown"),
     ("area_sqm", "Area (m²)", "float64", "payload area, card fallback", "Area in square metres", "no data"),
     ("price_per_sqm", "Price per m²", "float64", "derived", "price_monthly / area_sqm", "either input is null"),
@@ -2219,19 +2401,21 @@ _COLS = [
     ("area_name", "Area / compound", "string", "payload location path, card fallback", "Most specific location name", "listing sits at district level"),
     ("district_id", "District ID", "int64", "payload location.parent", "Location id of the district", "parent is a group such as 'Compounds in X'"),
     ("area_id", "Area ID", "int64", "payload location.id", "Location id of the area", "listing sits at district level"),
-    ("advertiser_id", "Advertiser ID", "int64", "payload user.id", "Aqarmap user id of the advertiser", "no data (never means owner)"),
-    ("advertiser_name", "Advertiser", "string", "payload user.fullName, card logo fallback", "Advertiser display name", "no data (never means owner)"),
+    ("advertiser_id", "Advertiser ID", "int64", "payload user.id", "Aqarmap user id of the advertiser (see export --advertiser)", "no data (never means owner)"),
+    ("advertiser_name", "Advertiser", "string", "payload user.fullName, card logo fallback", "Advertiser display name (see export --advertiser)", "no data (never means owner)"),
     ("has_paid_logo", "Paid logo", "int64", "payload user.has_active_logo_service", "1 if the agency pays for the card logo", "no data"),
     ("featured_type", "Featured type", "string", "payload featuredType", "Promotion flag, e.g. sponsored", "not promoted"),
     ("photo_count", "Photos", "int64", "payload photosCount, card fallback", "Number of photos", "no data"),
     ("photos", "Photo URLs", "string", "payload previewDetails.largePhotos", "JSON list of large photo URLs", "no data"),
     ("updated_at", "Updated at", "string", "payload previewDetails.updatedAt", "Last update, ISO with offset. Not the posting date", "no data"),
-    ("posted_date", "Posted", "string", "payload if present, else detail page", "Posting date. Never filled from updated_at", "not available from any source"),
+    ("posted_date", "Posted", "string", "payload if present, else detail page <time datetime>", "Posting date (YYYY-MM-DD from the detail page). Never filled from updated_at", "not available from any source"),
     ("furnished", "Furnished", "string", "payload if present, else detail page", "yes / no / raw detail text", "not available from any source"),
     ("lat", "Lat", "float64", "payload if present, else detail page", "Latitude inside the Alexandria box; shared-centroid rows dropped", "no coordinates or centroid"),
     ("lng", "Lng", "float64", "payload if present, else detail page", "Longitude, same rules as Lat", "no coordinates or centroid"),
     ("payment_method_label", "Payment method", "string", "payload previewDetails.paymentMethodLabel", "Raw label key", "no data"),
     ("category", "Category", "string", "payload category", "Raw site category, meaning unconfirmed", "no data"),
+    ("description", "Description", "string", "payload, only if the payload carries it", "Listing description, phone-like strings masked, cut at 30,000 chars", "payload has no description"),
+    ("amenities", "Amenities", "string", "payload, only if the payload carries it", "JSON list of amenity names", "payload has no amenities"),
     ("detail_seller_type", "Seller type (detail)", "string", "detail page", "Detail-page seller taxonomy (e.g. Developer); differs from Advertiser", "detail page not fetched"),
     ("parse_source", "Parsed from", "string", "crawl", "payload | card (page fell back to cards)", "never null"),
     ("first_seen", "First seen", "string", "crawl", "UTC time of first sighting", "never null"),
@@ -2270,6 +2454,29 @@ def load_rows(db: DB, with_text: bool = False) -> list[dict]:
         d["price_per_sqm"] = round(d["price_monthly"] / d["area_sqm"], 1) if d.get("price_monthly") and d.get("area_sqm") else None
         d["active"] = bool(d.get("active"))
     return rows
+
+
+def anonymise_advertisers(db: DB, rows: list[dict], mode: str) -> list[dict]:
+    """mode 'drop' nulls advertiser id/name; 'hash' replaces them with a salted SHA-256 prefix (stable within this
+    database, not reversible without the salt kept in `meta`). Flags such as possible_dup were computed before this."""
+    if mode == "keep":
+        return rows
+    salt = db.meta_get("advertiser_salt")
+    if salt is None:
+        salt = secrets.token_hex(16)
+        db.meta_set("advertiser_salt", salt)
+        db.commit()
+    out = []
+    for r in rows:
+        r = dict(r)
+        for k in ("advertiser_id", "advertiser_name"):
+            v = r.get(k)
+            if mode == "drop" or v is None:
+                r[k] = None
+            else:
+                r[k] = hashlib.sha256(f"{salt}:{v}".encode("utf-8")).hexdigest()[:12]
+        out.append(r)
+    return out
 
 
 def _cell(r: dict, c: str):
@@ -2314,19 +2521,19 @@ def export_jsonl(rows: list[dict], path: Path):
                 o = {k: r.get(k) for k, _ in EXPORT_COLUMNS}
                 o["photos"] = r.get("photos_list")
                 o["flags"] = r.get("flags_list")
+                if o.get("amenities"):
+                    o["amenities"] = json.loads(o["amenities"])
                 f.write(json.dumps(o, ensure_ascii=False) + "\n")
     atomic_write(path, w)
 
 
-def export_parquet(rows: list[dict], path: Path):
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as e:
-        raise SystemExit("Parquet needs pyarrow: pip install pyarrow") from e
+def export_parquet(rows: list[dict], path: Path, adv_mode: str = "keep"):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
     types = {"int64": pa.int64(), "float64": pa.float64(), "string": pa.string(), "bool": pa.bool_()}
-    schema = pa.schema([(k, types[t]) for k, _, t, *_ in _COLS])   # list columns are already JSON strings
-    data = {k: [r.get(k) for r in rows] for k, *_ in _COLS}
+    override = {"advertiser_id": pa.string()} if adv_mode == "hash" else {}
+    schema = pa.schema([(k, override.get(k, types[t])) for k, _h, t, *_rest in _COLS])   # list columns are JSON strings
+    data = {k: [r.get(k) for r in rows] for k, *_rest in _COLS}
     table = pa.Table.from_pydict(data, schema=schema)
     atomic_write(path, lambda p: pq.write_table(table, p))
 
@@ -2350,7 +2557,7 @@ def export_xlsx(db: DB, rows: list[dict], path: Path, stats: dict, with_text: bo
         ws.append([_cell(r, c) for c, _ in cols])
         ws.cell(row=ws.max_row, column=idx["url"]).hyperlink = r["url"]
     widths = {"id": 10, "url": 38, "title": 46, "district": 20, "area_name": 28, "advertiser_name": 22, "photos": 30,
-              "flags": 26, "detail_text": 50}
+              "flags": 26, "detail_text": 50, "description": 50, "amenities": 30}
     for c, i in idx.items():
         ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 15)
     for c, fmt in (("price_monthly", "#,##0"), ("price_amount", "#,##0"), ("daily_rate", "#,##0"),
@@ -2454,6 +2661,8 @@ async def cmd_crawl(args, eng: Engine) -> int:
             if not r["complete"]:
                 for why in r["incomplete_reasons"]:
                     log.info("  not complete: %s", why)
+            for note in r.get("notes", []):
+                log.info("  note: %s", note)
             # coverage advice only when the cycle actually ran to its natural end
             if r["natural"] and r["site_total"] and r["seen"] < 0.95 * r["site_total"]:
                 log.warning("cycle ended naturally but saw only %d of ~%d listings (%.0f%%). Inventory shifts while crawling; "
@@ -2473,7 +2682,7 @@ async def cmd_crawl(args, eng: Engine) -> int:
 
 async def cmd_details(args, eng: Engine) -> int:
     if args.plan:
-        print(json.dumps(detail_plan(eng.db), indent=2))
+        print(json.dumps(detail_plan(eng.db, args.rps), indent=2))
         return EXIT_OK
     sources = load_sources(args)
     await eng.ensure_robots([page_url(sources[0], 1), urljoin(sources[0], "/en/listing/1-for-rent-x/")])
@@ -2517,7 +2726,7 @@ async def cmd_probe(args, eng: Engine) -> int:
     url = page_url(source, 1)
     r = await eng.fetch(url)
     (outdir / "page1.html").write_text(r.text, encoding="utf-8")
-    pp = parse_page(r.text, url)
+    pp = parse_page(r.text, url, args.assume_period)
     print(f"\n=== LIST PAGE  {url}\nHTTP {r.status}  {len(r.text):,} bytes  saved: {outdir / 'page1.html'}")
     print(f"site total: {pp.total}   cards: {len(pp.cards)}   payload objects: {len(pp.payload.listings) if pp.payload else 0}"
           f"   parsed from: {pp.parse_source}")
@@ -2530,8 +2739,9 @@ async def cmd_probe(args, eng: Engine) -> int:
     print("SCHEMA CANARY:", "OK" if not problems else "FAILED\n  - " + "\n  - ".join(problems))
     print(f"payload vs card disagreements on page 1: {len(pp.disagreements)}  {pp.disagreements[:6]}")
     if pp.rows:
-        fields = ["property_type", "price_monthly", "area_sqm", "beds", "baths", "floor", "finish_type", "advertiser_id",
-                  "advertiser_name", "photo_count", "updated_at", "district", "area_name", "posted_date", "furnished", "lat"]
+        fields = ["property_type", "price_amount", "price_period", "price_monthly", "area_sqm", "beds", "baths", "floor",
+                  "finish_type", "advertiser_id", "advertiser_name", "photo_count", "updated_at", "district", "area_name",
+                  "posted_date", "furnished", "lat", "description", "amenities"]
         print("field coverage on page 1:", {f: sum(x.get(f) is not None for x in pp.rows) for f in fields},
               f"of {len(pp.rows)}")
         for row in pp.rows[:3]:
@@ -2550,7 +2760,6 @@ async def cmd_probe(args, eng: Engine) -> int:
         if dr.status == 200:
             d = parse_detail(dr.text, detail_url)
             print(json.dumps({k: v for k, v in d.items() if k != "detail_text"}, ensure_ascii=False, indent=2))
-    print(f"\nTo build real test fixtures: python tools/make_fixtures.py {outdir}/page1.html")
     return EXIT_OK if pp.cards and not problems else EXIT_STRUCTURE
 
 
@@ -2578,40 +2787,51 @@ async def cmd_areas(args, eng: Engine) -> int:
 
 
 def cmd_reparse(args, db: DB) -> int:
-    """Rebuild every parsed column offline. `pages` re-reads raw_pages (HTML); `listings` rebuilds from each row's
-    stored raw_json + card_html; `details` re-maps stored detail text. Crawl-state columns are never touched."""
+    """Rebuild every parsed column offline. `pages` re-reads the latest stored raw_pages per source (HTML);
+    `listings` rebuilds from each row's stored raw_json + card_html; `details` re-maps stored detail text.
+    `all` does pages first, then rebuilds the listings the stored pages did not cover.
+    Crawl-state columns are never touched."""
     what = args.what
+    touched: set[int] = set()
     n = 0
-    pages = db.conn.execute("SELECT source, page, html FROM raw_pages ORDER BY source, page").fetchall()
-    if what in ("pages", "all") and pages:
+    if what in ("pages", "all"):
+        pages = db.conn.execute(
+            "SELECT source, page, html FROM raw_pages WHERE run_id=(SELECT MAX(r2.run_id) FROM raw_pages r2 "
+            "WHERE r2.source=raw_pages.source) ORDER BY source, page").fetchall()
+        if not pages:
+            log.warning("no raw pages stored (crawl with --save-raw)%s",
+                        "; falling back to per-listing data" if what == "all" else "")
         agree = {"pages": 0, "payload": 0, "card_fallback": 0, "disagreements": 0}
         for r in pages:
             html = gzip.decompress(r["html"]).decode("utf-8")
-            pp = parse_page(html, page_url(r["source"], r["page"]))
+            pp = parse_page(html, page_url(r["source"], r["page"]), args.assume_period)
             for row in pp.rows:
                 if db.conn.execute("SELECT 1 FROM listings WHERE id=?", (row["id"],)).fetchone():
                     db.update_parse_cols(row, blobs=True)
+                    touched.add(row["id"])
                     n += 1
             agree["pages"] += 1
             agree["payload" if pp.parse_source == "payload" else "card_fallback"] += 1
             agree["disagreements"] += len(pp.disagreements)
             log.debug("page %s/%s: %s ids_match=%s ld_match=%s disagree=%d", r["source"], r["page"], pp.parse_source,
                       pp.id_match, pp.ld_match, len(pp.disagreements))
-        log.info("re-parsed %d listing(s) from %d stored page(s): %s", n, agree["pages"], agree)
-    elif what in ("listings", "all", "pages", "payload", "cards"):
-        if what == "pages":
-            log.warning("no raw pages stored (crawl with --save-raw); falling back to per-listing data")
+        if pages:
+            log.info("re-parsed %d listing(s) from %d stored page(s): %s", n, agree["pages"], agree)
+    if what in ("listings", "all"):
+        m = 0
         for r in db.conn.execute("SELECT id, url, card_html, raw_json FROM listings").fetchall():
+            if r["id"] in touched:
+                continue
             payload = unzjson(r["raw_json"])
             card = None
             if r["card_html"]:
                 card = parse_card_fragment(zlib.decompress(r["card_html"]).decode("utf-8"), r["id"], r["url"])
             if payload is None and card is None:
                 continue
-            row, _ = build_row(payload, card, "{0.scheme}://{0.netloc}".format(urlparse(r["url"])))
+            row, _ = build_row(payload, card, "{0.scheme}://{0.netloc}".format(urlparse(r["url"])), args.assume_period)
             db.update_parse_cols(row, blobs=False)
-            n += 1
-        log.info("re-parsed %d listing(s) from stored raw_json + card_html", n)
+            m += 1
+        log.info("re-parsed %d listing(s) from stored raw_json + card_html", m)
     if what in ("details", "all"):
         m = 0
         for r in db.conn.execute("SELECT id, detail_text FROM listings WHERE detail_text IS NOT NULL").fetchall():
@@ -2619,7 +2839,8 @@ def cmd_reparse(args, db: DB) -> int:
             if d:
                 db.conn.execute(f"UPDATE listings SET {', '.join(f'{k}=?' for k in d)} WHERE id=?", [*d.values(), r["id"]])
                 m += 1
-        log.info("re-parsed %d detail text(s) (text-based pairs only)", m)
+        log.info("re-parsed %d detail text(s) (text-based pairs only; the <time> posting date needs the HTML, "
+                 "so run `details --redo --fields posted_date` for that)", m)
     db.commit()
     counts = refresh_flags(db)
     print_quality(db.stats())
@@ -2667,11 +2888,20 @@ def cmd_validate(args, db: DB) -> int:
 
 
 def cmd_diff(args, db: DB) -> int:
-    done = [r["id"] for r in db.conn.execute("SELECT id FROM runs WHERE kind='crawl' AND complete=1 ORDER BY id")]
-    a = args.from_run if args.from_run else (done[-2] if len(done) >= 2 else None)
-    b = args.to_run if args.to_run else (done[-1] if done else None)
+    """Default: latest complete crawl vs the latest complete crawl that finished at least --min-gap-hours earlier,
+    so two back-to-back passes are not compared with each other."""
+    done = [dict(r) for r in db.conn.execute(
+        "SELECT id, ended_at FROM runs WHERE kind='crawl' AND complete=1 AND ended_at IS NOT NULL ORDER BY id")]
+    by_id = {r["id"]: r for r in done}
+    b = args.to_run or (done[-1]["id"] if done else None)
+    a = args.from_run
+    if a is None and b in by_id:
+        cutoff = parse_ts(by_id[b]["ended_at"]) - timedelta(hours=args.min_gap_hours)
+        older = [r for r in done if r["id"] < b and parse_ts(r["ended_at"]) <= cutoff]
+        a = older[-1]["id"] if older else None
     if a is None or b is None:
-        log.error("need two complete crawl runs (have %d). Pass --from and --to run ids explicitly if you want others.", len(done))
+        log.error("need two complete crawl runs finished at least %g hours apart (have %d complete). "
+                  "Pass --from/--to run ids, or lower --min-gap-hours.", args.min_gap_hours, len(done))
         return EXIT_ERROR
     q = db.conn.execute
     new = q("SELECT id,url,title,property_type,price_monthly,district FROM listings WHERE first_seen_run>? AND first_seen_run<=?", (a, b)).fetchall()
@@ -2704,16 +2934,34 @@ def cmd_diff(args, db: DB) -> int:
     return EXIT_OK
 
 
+_FORMAT_DEPS = {"xlsx": "openpyxl", "parquet": "pyarrow"}
+
+
 def cmd_export(args, db: DB) -> int:
+    all_fmts = ["csv", "xlsx", "jsonl", "parquet"]
+    if args.format == "all":
+        fmts = []
+        for f in all_fmts:
+            dep = _FORMAT_DEPS.get(f)
+            if dep and importlib.util.find_spec(dep) is None:
+                log.warning("skipping %s: %s is not installed (pip install %s)", f, dep, dep)
+                continue
+            fmts.append(f)
+    else:
+        fmts = [args.format]
+        dep = _FORMAT_DEPS.get(args.format)
+        if dep and importlib.util.find_spec(dep) is None:
+            log.error("%s export needs %s: %s -m pip install %s", args.format, dep, sys.executable, dep)
+            return EXIT_DEPS
     rows = load_rows(db, args.with_text)
     if not rows:
         log.error("no listings in the database; run `crawl` first")
         return EXIT_ERROR
     if args.active_only:
         rows = [r for r in rows if r["active"]]
+    rows = anonymise_advertisers(db, rows, args.advertiser)
     base = Path(args.out)
     stats = db.stats()
-    fmts = ["csv", "xlsx", "jsonl", "parquet"] if args.format == "all" else [args.format]
     for f in fmts:
         path = base.with_suffix(f".{f}")
         if f == "csv":
@@ -2721,7 +2969,7 @@ def cmd_export(args, db: DB) -> int:
         elif f == "jsonl":
             export_jsonl(rows, path)
         elif f == "parquet":
-            export_parquet(rows, path)
+            export_parquet(rows, path, args.advertiser)
         else:
             export_xlsx(db, rows, path, stats, args.with_text)
         log.info("wrote %s (%d rows)", path, len(rows))
@@ -2744,6 +2992,18 @@ def cmd_status(args, db: DB) -> int:
 
 
 # --------------------------------------------------------------------------- CLI
+def resolve_user_agent(args) -> str:
+    """Honest, identifiable UA by default. A browser UA only on explicit request; --user-agent overrides both."""
+    if args.user_agent:
+        return args.user_agent
+    if args.browser_ua:
+        return BROWSER_UA
+    contact = (args.contact or "").strip()
+    if contact and "@" in contact and "://" not in contact:
+        contact = f"mailto:{contact}"
+    return f"aqarmap-scraper/{__version__} (research crawler" + (f"; +{contact}" if contact else "") + ")"
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--db", default=DEFAULT_DB, help="SQLite file (default: %(default)s)")
@@ -2757,7 +3017,12 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--max-retries", type=int, default=5)
     common.add_argument("--backoff-base", type=float, default=2.0, help="seconds, doubles per retry")
     common.add_argument("--block-limit", type=int, default=4, help="stop after N consecutive blocked responses")
-    common.add_argument("--user-agent", default=DEFAULT_UA)
+    common.add_argument("--contact", help="email or URL put into the User-Agent so the site can reach you (recommended)")
+    common.add_argument("--browser-ua", action="store_true",
+                        help="send a generic browser User-Agent instead of the identifying one (only if the site rejects it)")
+    common.add_argument("--user-agent", help="full User-Agent string (overrides --contact and --browser-ua)")
+    common.add_argument("--assume-period", choices=["month", "day", "week", "year"],
+                        help="price period to use when the page shows none. Rows are flagged assumed_period")
     common.add_argument("--proxy", help="plain HTTP(S) proxy for your own network setup. No rotation is built in")
     common.add_argument("--fetcher", choices=["httpx", "playwright"], default="httpx")
     common.add_argument("--log-file", default="aqarmap_scraper.log")
@@ -2778,13 +3043,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("crawl", parents=[common], help="result pages -> listings (payload first, cards cross-checked)")
     sp.add_argument("--max-pages", type=int, default=1000, help="hard cap per source (use 3 for a smoke test)")
     sp.add_argument("--refresh", action="store_true",
-                    help="discard an UNFINISHED cycle and start a new snapshot (a finished cycle always starts fresh anyway)")
+                    help="discard a resumable cycle and start a new snapshot (a cycle that reached the end of results always starts fresh anyway)")
     sp.add_argument("--passes", type=int, default=2,
                     help="full cycles back to back (default 2: a ranked, shifting sort order can skip listings in one pass)")
-    sp.add_argument("--delist-after", type=int, default=2,
-                    help="mark a listing inactive after N consecutive COMPLETE cycles that missed it (default 2)")
+    sp.add_argument("--delist-after", type=int, default=3,
+                    help="mark a listing inactive after N complete cycles on N different UTC days that missed it (default 3)")
     sp.add_argument("--save-raw", action=argparse.BooleanOptionalAction, default=True,
-                    help="store each list page gzipped in raw_pages so parser changes are an offline `reparse` (default on)")
+                    help="store each list page gzipped in raw_pages (this and the previous cycle are kept) so parser "
+                         "changes are an offline `reparse` (default on)")
 
     sp = sub.add_parser("details", parents=[common], help="listing pages -> detail_* columns, only for missing fields")
     sp.add_argument("--plan", action="store_true", help="print which fields the payload left empty and the cost; fetch nothing")
@@ -2794,15 +3060,16 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--redo", action="store_true", help="re-fetch every active listing, even finished ones")
 
     sp = sub.add_parser("reparse", parents=[common], help="rebuild parsed columns offline (no network)")
-    sp.add_argument("--what", choices=["all", "pages", "listings", "payload", "cards", "details"], default="all",
-                    help="pages = from raw_pages HTML; listings/payload/cards = from stored raw_json + card_html")
+    sp.add_argument("--what", choices=["all", "pages", "listings", "details"], default="all",
+                    help="pages = from stored raw_pages HTML; listings = from stored raw_json + card_html; details = stored detail text")
 
     sp = sub.add_parser("validate", parents=[common], help="data-quality flags and coverage by property type")
     sp.add_argument("--out", help="write flagged listings to this CSV")
 
     sp = sub.add_parser("diff", parents=[common], help="new / delisted / price-changed listings between two crawl runs")
-    sp.add_argument("--from", dest="from_run", type=int, help="older run id (default: second-to-last complete crawl)")
+    sp.add_argument("--from", dest="from_run", type=int, help="older run id (default: latest complete run >= --min-gap-hours older than --to)")
     sp.add_argument("--to", dest="to_run", type=int, help="newer run id (default: last complete crawl)")
+    sp.add_argument("--min-gap-hours", type=float, default=12.0, help="minimum age gap for the default --from (default 12)")
     sp.add_argument("--out", help="write the full diff to this CSV")
 
     sp = sub.add_parser("export", parents=[common], help="write csv/xlsx/jsonl/parquet (atomic)")
@@ -2810,6 +3077,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--out", default="aqarmap_alexandria_rent", help="output path without extension")
     sp.add_argument("--with-text", action="store_true", help="include the stored detail-page text column")
     sp.add_argument("--active-only", action="store_true", help="skip listings marked delisted")
+    sp.add_argument("--advertiser", choices=["keep", "hash", "drop"], default="keep",
+                    help="advertiser id/name in the export: keep, hash (salted, stable within this DB) or drop")
 
     sub.add_parser("status", parents=[common], help="progress, runs and data quality")
     sub.add_parser("areas", parents=[common], help="list district URLs for sharding (fallback only)")
@@ -2848,12 +3117,23 @@ async def run_async(args, db: DB) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose, args.log_file, args.log_json)
-    db = DB(args.db)
+    args.user_agent = resolve_user_agent(args)
+    if args.cmd in ("crawl", "details", "probe") and "(research crawler)" in args.user_agent and not args.browser_ua:
+        log.warning("no --contact set: the User-Agent does not say who to reach. Add --contact you@example.com.")
+    lock: DbLock | None = None
+    db: DB | None = None
     try:
+        if args.cmd in LOCKED_COMMANDS:
+            lock = DbLock(args.db)
+            lock.acquire()
+        db = DB(args.db)
         sync = {"export": cmd_export, "status": cmd_status, "reparse": cmd_reparse, "validate": cmd_validate, "diff": cmd_diff}
         if args.cmd in sync:
             return sync[args.cmd](args, db)
         return asyncio.run(run_async(args, db))
+    except AlreadyRunning as e:
+        log.error("%s", e)
+        return EXIT_LOCKED
     except RobotsDisallowed as e:
         log.error("%s", e)
         return EXIT_ROBOTS
@@ -2875,7 +3155,10 @@ def main(argv: list[str] | None = None) -> int:
         log.warning("interrupted; progress is saved, re-run the same command to resume")
         return 130
     finally:
-        db.close()
+        if db is not None:
+            db.close()
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":
