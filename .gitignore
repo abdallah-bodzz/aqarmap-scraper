@@ -1,0 +1,44 @@
+# Local data (folders stay in git through .gitkeep)
+data/*
+!data/.gitkeep
+samples/*
+!samples/.gitkeep
+legacy/*
+!legacy/.gitkeep
+runs/
+raw_pages/
+
+# SQLite databases, backups and sidecar files
+*.db
+*.db.bak-*
+*.db-wal
+*.db-shm
+
+# Exports and logs
+*.csv
+*.xlsx
+*.jsonl
+*.parquet
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
