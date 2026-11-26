@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aqarmap-scraper"
+version = "4.0.0"
+description = "Resumable SQLite-backed scraper for Aqarmap listing and detail pages."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary. All rights reserved." }
+authors = [{ name = "Abdallah A Khames" }]
+classifiers = [
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "httpx[http2]>=0.27",
+    "selectolax>=0.3.21",
+]
+
+[project.optional-dependencies]
+export = ["pyarrow>=15", "openpyxl>=3.1"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
+
+[project.scripts]
+aqarmap-scraper = "aqarmap_scraper:main"
+
+[tool.setuptools]
+py-modules = ["aqarmap_scraper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# v4 is committed as-is. It has long lines and one unused import that I did not change.
+"aqarmap_scraper.py" = ["E501", "F401"]
