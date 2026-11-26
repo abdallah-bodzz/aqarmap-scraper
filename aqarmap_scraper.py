@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-aqarmap_scraper.py - resumable, polite scraper for Aqarmap listing pages (v3).
+aqarmap_scraper.py - resumable, polite scraper for Aqarmap listing pages (v4).
 
 Commands
     probe     fetch page 1 + one detail page, save raw HTML to ./samples/, run the schema canary,
               show payload/card/ld+json agreement, sort-control hints, optional pagination depth test.
+              Given a single listing URL (`--url .../listing/<id>-...`) it probes that detail page instead.
     crawl     phase 1: walk the paginated result pages. One row per listing, payload first, card as cross-check.
-    details   phase 4 (optional): open listing pages only for fields the payload lacks. `--plan` shows the numbers.
+              Given single listing URLs it fetches each one: new listings are inserted from the detail page, known
+              ones are enriched in place (same row, same column semantics).
+    details   phase 4 (optional): open listing pages and enrich the rows already in the DB: the detail payload,
+              JSON-LD and breadcrumbs fill the v4 columns, DOM labels fill the detail_* fallbacks.
+              `--plan` shows the numbers; `--redo --fields jsonld` back-fills rows fetched by an older version.
     validate  data-quality flags and coverage by property type.
     reparse   rebuild every parsed column offline from stored raw pages / raw JSON (no network).
     export    write CSV / XLSX / JSONL / Parquet (atomic, typed, with a data dictionary).
@@ -16,8 +21,12 @@ Commands
 
 Design notes
     * SQLite (WAL) is the source of truth. Every page commits, so Ctrl-C / crashes lose nothing.
-    * Primary data source: the JSON the page embeds (React Server Components stream, `initialListings`).
-      The HTML cards are parsed too and compared field by field; on an id mismatch the page falls back to cards.
+    * Primary data source: the JSON the page embeds (React Server Components stream). Results pages carry the
+      `initialListings` array; detail pages carry one `"listing":{...}` object (found by content signature, the
+      richest of its repeated copies is kept) plus two JSON-LD blocks: the RealEstateListing (stable source of
+      price, rooms, area, geo, images, datePosted...) and the BreadcrumbList.
+      The HTML cards of results pages are parsed too and compared field by field; on an id mismatch the page
+      falls back to cards. On detail pages payload and JSON-LD are compared the same way (`ld_*` disagreements).
     * A "cycle" is one pass over a source's pages. An unfinished cycle resumes. After a complete one the next
       `crawl` starts a fresh snapshot. A cycle only counts as complete when every expected page was fetched,
       it saw >= 97% of the site total and >= 90% of the previous complete cycle. Only then do misses count.
@@ -77,8 +86,8 @@ import httpx  # noqa: E402
 from selectolax.lexbor import LexborHTMLParser as HTMLParser  # noqa: E402
 from selectolax.lexbor import LexborNode as Node  # noqa: E402
 
-__version__ = "3.0.0"
-SCHEMA_VERSION = 3
+__version__ = "4.0.0"
+SCHEMA_VERSION = 4
 
 DEFAULT_URL = "https://aqarmap.com.eg/en/for-rent/property-type/alexandria/"
 DEFAULT_DB = "aqarmap_alexandria_rent.db"
@@ -230,14 +239,15 @@ def scrub_card_html(html: str) -> str:
     return scrub_phones(_CONTACT_HREF_RE.sub('href="#"', strip_svg(html)))
 
 
-_PHONE_KEYS = {"phones", "phone", "mobile", "whatsapp", "whatsapp_number", "has_whatsapp"}
+_PHONE_KEYS = {"phones", "phone", "phone_number", "phonenumber", "phone_numbers", "listing_phones", "mobile",
+               "whatsapp", "whatsapp_number", "whatsappnumber"}   # has_whatsapp is a boolean: kept as data
 
 
 def scrub_payload(obj):
     """Drop phone containers from a payload object and mask anything phone-like left in strings."""
     def walk(o):
         if isinstance(o, dict):
-            return {k: walk(v) for k, v in o.items() if k not in _PHONE_KEYS}
+            return {k: walk(v) for k, v in o.items() if str(k).lower() not in _PHONE_KEYS}
         if isinstance(o, list):
             return [walk(v) for v in o]
         if isinstance(o, str):
@@ -321,6 +331,8 @@ class RobotsRules:
 RESIDENTIAL_TYPES = frozenset({
     "apartment", "villa", "duplex", "penthouse", "studio", "chalet", "townhouse", "twin-house", "roof",
     "hotel-apartment", "room", "cabin", "full-floor",
+    "furnished-apartment", "furnished-villa", "furnished-duplex", "furnished-penthouse", "furnished-studio",
+    "furnished-chalet",   # slugs of detail pages; `furnished-apartment` is confirmed by the handoff spec
 })
 NON_RESIDENTIAL_TYPES = frozenset({
     "office", "shop", "clinic", "commercial", "administrative", "warehouse", "factory", "land", "building",
@@ -676,22 +688,94 @@ def rsc_text(html: str) -> str:
 class Payload:
     listings: list[dict]
     query: str | None
+    kind: str = "list"   # "list" = the initialListings array of a results page | "detail" = the one `"listing":{...}` of a detail page
 
 
 # keys every listing object must have for the payload to be usable at all
 HARD_KEYS = ("id", "slug", "title", "price", "area", "location", "previewDetails")
+# a detail page's listing object has its own shape (snake_case, `property_type` object, no previewDetails)
+DETAIL_HARD_KEYS = ("id", "slug", "title", "price", "area")
+_LISTING_KEY = '"listing":'
 
 
-def extract_payload(html: str) -> Payload:
+def _populated(o) -> int:
+    """Number of non-empty leaves in an object. Used to pick the richest copy of a duplicated object."""
+    if isinstance(o, dict):
+        return sum(_populated(v) for v in o.values())
+    if isinstance(o, list):
+        return sum(_populated(v) for v in o)
+    return 0 if clean(o) is None else 1
+
+
+def decode_listing_objects(text: str) -> dict[int, list[dict]]:
+    """Every `"listing":{...}` object in the decoded RSC stream, grouped by listing id.
+
+    Found by content signature only: the key, then the object that starts at the next `{`. The object's end is
+    found by the JSON decoder itself (a string-aware bracket match), so braces inside strings cannot break it.
+    RSC row ids (`4c:`, `52`, ...) and component paths are never used: they change between Next.js builds.
+    """
+    dec = json.JSONDecoder()
+    found: dict[int, list[dict]] = defaultdict(list)
+    pos = 0
+    while True:
+        k = text.find(_LISTING_KEY, pos)
+        if k < 0:
+            break
+        j = k + len(_LISTING_KEY)
+        pos = j
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        if j >= len(text) or text[j] != "{":
+            continue
+        try:
+            obj, end = dec.raw_decode(text, j)
+        except ValueError:
+            continue
+        pos = end
+        if isinstance(obj, dict):
+            lid = to_int(obj.get("id"))
+            if lid is not None:
+                obj["id"] = lid
+                found[lid].append(obj)
+    return dict(found)
+
+
+def _extract_detail_payload(text: str, html: str, target_id: int | None) -> Payload:
+    found = decode_listing_objects(text)
+    if not found:
+        raise PayloadError("neither 'initialListings' nor a decodable '\"listing\":{\"id\":...}' object was found "
+                           "in the RSC stream")
+    if target_id is None:
+        ld, _ = extract_detail_extras(html)
+        target_id = ld.get("id") if ld else None
+    if target_id in found:
+        tid = target_id
+    else:
+        # the page's own listing is repeated (header, sticky header, mobile footer); similar listings are not
+        # stored under a "listing" key, so the most repeated / richest id is the page's listing
+        tid = max(found, key=lambda i: (len(found[i]), max(_populated(o) for o in found[i])))
+        if target_id is not None:
+            log.warning("listing id %s (from the URL / JSON-LD) not found in the payload; using id %s", target_id, tid)
+    best = max(found[tid], key=_populated)   # duplicates are deduplicated by id: keep the fullest copy
+    return Payload(listings=[best], query=None, kind="detail")
+
+
+def extract_payload(html: str, target_id: int | None = None) -> Payload:
+    """Results page -> the `initialListings` array (unchanged path). A page without that array is treated as a
+    detail page: its single `"listing":{...}` object comes back as a one-item Payload(kind="detail").
+    Raises PayloadError when neither shape can be decoded."""
     text = rsc_text(html)
     if not text:
         raise PayloadError("no self.__next_f stream found in the page")
     marker = '"initialListings":'
     k = text.find(marker)
     if k < 0:
-        raise PayloadError("'initialListings' not found in the RSC stream")
+        return _extract_detail_payload(text, html, target_id)
+    start = k + len(marker)
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
     try:
-        arr, _ = json.JSONDecoder().raw_decode(text, k + len(marker))
+        arr, _ = json.JSONDecoder().raw_decode(text, start)
     except ValueError as e:
         raise PayloadError(f"initialListings is not valid JSON: {e}") from e
     if not isinstance(arr, list) or not all(isinstance(x, dict) for x in arr):
@@ -705,6 +789,121 @@ def extract_payload(html: str) -> Payload:
         except ValueError:
             pass
     return Payload(listings=arr, query=query)
+
+
+# --------------------------------------------------------------------------- detail page: JSON-LD + breadcrumbs
+def _as_list(v) -> list:
+    return [] if v is None else (v if isinstance(v, list) else [v])
+
+
+def _ld_types(o: dict) -> set[str]:
+    return {str(t) for t in _as_list(o.get("@type"))}
+
+
+def _ld_num(v):
+    if isinstance(v, dict):
+        v = v.get("value")
+    return to_num(v)
+
+
+def parse_iso_utc(s) -> str | None:
+    """ISO 8601 -> 'YYYY-MM-DDTHH:MM:SSZ' in UTC. Offsets are converted, a naive time is taken as UTC.
+    Future dates are kept as they are: the site really serves them and nothing here judges them."""
+    if not isinstance(s, str) or not s.strip():
+        return None
+    t = re.sub(r"(\d)\.\d+", r"\1", s.strip())          # fractional seconds: Python < 3.11 cannot parse every length
+    t = re.sub(r"[zZ]$", "+00:00", t)
+    try:
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _find_ld_node(data, wanted: str) -> dict | None:
+    stack = [data]
+    while stack:
+        o = stack.pop()
+        if isinstance(o, dict):
+            if wanted in _ld_types(o):
+                return o
+            stack.extend(v for v in o.values() if isinstance(v, (dict, list)))
+        elif isinstance(o, list):
+            stack.extend(o)
+    return None
+
+
+def parse_detail_ld(node: dict) -> dict:
+    """The RealEstateListing node -> flat dict. Every value is None / [] when absent: nothing is guessed."""
+    offers = _as_list(node.get("offers"))
+    offers = offers[0] if offers and isinstance(offers[0], dict) else {}
+    item = _as_list(node.get("itemOffered")) or _as_list(offers.get("itemOffered"))
+    item = item[0] if item and isinstance(item[0], dict) else {}
+    addr = item.get("address") if isinstance(item.get("address"), dict) else {}
+    geo = item.get("geo") if isinstance(item.get("geo"), dict) else {}
+    url = clean(node.get("url")) if isinstance(node.get("url"), str) else None
+    lid = _listing_id(url) or _listing_id(str(item.get("@id") or "")) or to_int(node.get("identifier"))
+    amen = []
+    for a in _as_list(item.get("amenityFeature")):
+        if isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"].strip():
+            v = a.get("value", True)           # the site marks all of them true; an explicit false is honoured
+            if v not in (False, "false", "False", 0, "0"):
+                amen.append(a["name"].strip())
+    images = []
+    for im in _as_list(node.get("image")):
+        u = im if isinstance(im, str) else (im.get("url") or im.get("contentUrl")) if isinstance(im, dict) else None
+        if isinstance(u, str) and u.strip():
+            images.append(u.strip())
+    availability = clean(offers.get("availability"))
+    price = _ld_num(offers.get("price"))
+    return {
+        "id": lid, "name": clean(node.get("name")), "url": url,
+        "date_posted_iso": parse_iso_utc(node.get("datePosted")), "date_posted_raw": clean(node.get("datePosted")),
+        "category": clean(node.get("category")),
+        "price": price, "currency": clean(offers.get("priceCurrency")),
+        "availability": re.sub(r"^https?://schema\.org/", "", availability) if isinstance(availability, str) else None,
+        "property_type": next(iter(sorted(_ld_types(item))), None) if item else None,
+        "rooms": to_int(_ld_num(item.get("numberOfRooms"))), "baths": to_int(_ld_num(item.get("numberOfBathroomsTotal"))),
+        "area": _ld_num(item.get("floorSize")),
+        "street": clean(addr.get("streetAddress")), "country": clean(addr.get("addressCountry")),
+        "locality": clean(addr.get("addressLocality")),
+        "lat": to_num(geo.get("latitude")), "lng": to_num(geo.get("longitude")),
+        "amenities": amen, "images": images,
+    }
+
+
+def parse_breadcrumb_names(node: dict) -> list[str]:
+    els = [e for e in _as_list(node.get("itemListElement")) if isinstance(e, dict)]
+    els.sort(key=lambda e: to_num(e.get("position")) or 0)
+    out = []
+    for e in els:
+        item = e.get("item")
+        name = (item.get("name") if isinstance(item, dict) else None) or e.get("name")
+        if isinstance(name, str) and squash(name):
+            out.append(squash(name))
+    return out
+
+
+def extract_detail_extras(html: str) -> tuple[dict | None, list[str] | None]:
+    """(JSON-LD listing dict, breadcrumb names) of a detail page. Anchors: <script id="listing-details-schema"> and
+    <script id="Breadcrumb-schema">; any other ld+json script is searched as a fallback."""
+    doc = HTMLParser(html)
+    ld = crumbs = None
+    for s in doc.css("script"):
+        attrs = s.attributes
+        if attrs.get("type") != "application/ld+json" and attrs.get("id") not in ("listing-details-schema", "Breadcrumb-schema"):
+            continue
+        try:
+            data = json.loads(s.text())
+        except (ValueError, TypeError):
+            continue
+        if ld is None and (node := _find_ld_node(data, "RealEstateListing")) is not None:
+            ld = parse_detail_ld(node)
+        if crumbs is None and (node := _find_ld_node(data, "BreadcrumbList")) is not None:
+            crumbs = parse_breadcrumb_names(node) or None
+    return ld, crumbs
 
 
 def payload_problems(listings: list[dict]) -> list[str]:
@@ -775,7 +974,7 @@ def parse_location(loc) -> dict:
 
 _POSTED_KEYS = ("createdAt", "created_at", "postedAt", "publishedAt", "creationDate", "created")
 _FURNISHED_KEYS = ("furnished", "isFurnished", "is_furnished")
-_LAT_KEYS, _LNG_KEYS = ("lat", "latitude"), ("lng", "lon", "longitude")
+_LAT_KEYS, _LNG_KEYS = ("lat", "latitude", "center_lat"), ("lng", "lon", "longitude", "center_lng")
 
 
 def _find_key(obj, keys: tuple[str, ...]):
@@ -804,54 +1003,176 @@ def to_int(v) -> int | None:
     return int(n) if n is not None else None
 
 
-def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.com.eg") -> tuple[dict, list[tuple]]:
-    """Merge one payload object and one card into a listing row. Payload first, card fallback, NULL otherwise.
-    Returns (row, disagreements) where each disagreement is (field, payload_value, card_value)."""
+def g(o, *keys):
+    """First usable value among `keys` of dict `o`. The two payload shapes name things differently
+    (results pages: camelCase, detail pages: snake_case), so every field is looked up under both."""
+    if not isinstance(o, dict):
+        return None
+    for k in keys:
+        v = clean(o.get(k))
+        if v is not None:
+            return v
+    return None
+
+
+def to_flag(v) -> int | None:
+    v = clean(v)
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return int(v.strip().lower() in ("1", "true", "yes"))
+    return int(bool(v))
+
+
+def jlist(v) -> str | None:
+    """JSON text for a non-empty list / dict, else NULL (an empty list is 'no data', not a value)."""
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":")) if v else None
+
+
+def norm_attrs(p: dict) -> dict:
+    """`attributes` as one dict. Results pages send {rooms, baths, floor, finishType}; detail pages send a list of
+    {custom_field: {name, label}, value} where only `name` is ASCII (`label` is Arabic even on /en/ pages)."""
+    a = p.get("attributes")
+    if isinstance(a, dict):
+        return dict(a)
+    out: dict = {}
+    for it in a if isinstance(a, list) else []:
+        if not isinstance(it, dict):
+            continue
+        cf = it.get("custom_field") if isinstance(it.get("custom_field"), dict) else {}
+        name = cf.get("name") or it.get("name")
+        if isinstance(name, str) and name:
+            out.setdefault(name, it.get("value"))
+            out.setdefault(re.sub(r"[-_](\w)", lambda m: m.group(1).upper(), name), it.get("value"))   # finish-type -> finishType
+    return out
+
+
+def translation(p: dict, locale: str) -> dict:
+    for t in p.get("translations") if isinstance(p.get("translations"), list) else []:
+        if isinstance(t, dict) and str(t.get("locale") or "").lower().startswith(locale):
+            return t
+    return {}
+
+
+def _plans(p: dict) -> list[dict]:
+    plans = p.get("payment_plans") if p.get("payment_plans") is not None else p.get("paymentPlans")
+    return [x for x in plans if isinstance(x, dict)] if isinstance(plans, list) else []
+
+
+DURATION_PERIOD = {1: "day", 7: "week", 30: "month", 365: "year"}
+
+
+def plan_price(plans: list[dict], duration: int) -> float | None:
+    """Price of the plan whose `duration` (days) is exactly `duration`. 30 = monthly, 1 = daily. Never assumes that
+    the first plan is the monthly one."""
+    for pl in plans:
+        if to_num(pl.get("duration")) == duration:
+            v = to_num(clean(pl.get("price")))
+            if v:
+                return float(v)
+    return None
+
+
+def _thumb(o) -> str | None:
+    if isinstance(o, dict):
+        t = o.get("thumbnails")
+        return clean(t.get("large")) if isinstance(t, dict) else clean(o.get("large") or o.get("url") or o.get("src"))
+    return clean(o) if isinstance(o, str) else None
+
+
+def _amenity_codes(v) -> list[str]:
+    out = []
+    for a in v if isinstance(v, list) else []:
+        c = a if isinstance(a, str) else (a.get("code") or a.get("name") or a.get("slug")) if isinstance(a, dict) else None
+        if isinstance(c, str) and c.strip():
+            out.append(c.strip())
+    return out
+
+
+def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.com.eg",
+              ld: dict | None = None, crumbs: list[str] | None = None, kind: str = "list") -> tuple[dict, list[tuple]]:
+    """Merge one payload object (results-page or detail-page shape), an optional card and, on detail pages, the
+    JSON-LD block and the breadcrumbs into one listing row. Payload first, card fallback, NULL otherwise; the JSON-LD
+    wins for the fields it is the stable source of. Returns (row, disagreements); each disagreement is
+    (field, payload_value, other_value) where `ld_*` fields are payload-vs-JSON-LD and the rest payload-vs-card."""
     row: dict = {}
     dis: list[tuple] = []
-    pd_ = (p or {}).get("previewDetails") or {}
-    attrs = (p or {}).get("attributes") or {}
-    user = (p or {}).get("user") or {}
-    lid = (p or {}).get("id") if p else card.id
+    P: dict = p or {}
+    ld = ld or {}
+    pd_ = P.get("previewDetails") if isinstance(P.get("previewDetails"), dict) else {}
+    attrs = norm_attrs(P)
+    user = P.get("user") if isinstance(P.get("user"), dict) else {}
+    pt = P.get("property_type") if isinstance(P.get("property_type"), dict) else {}
+    sec = P.get("section") if isinstance(P.get("section"), dict) else {}
+
+    def pv(*keys):    # previewDetails first (results pages), then the object itself (detail pages)
+        v = g(pd_, *keys)
+        return v if v is not None else g(P, *keys)
+
+    lid = P.get("id") if p else card.id
     row["id"] = int(lid)
     row["parse_source"] = "payload" if p else "card"
-    slug = clean((p or {}).get("slug"))
+    slug = clean(P.get("slug"))
     row["slug"] = slug
-    row["url"] = card.url if card and card.url else f"{origin}/en/listing/{lid}-{slug}/"
-    row["title"] = clean((p or {}).get("title")) or (card.title if card else None)
+    ld_url = _abs_url(origin, ld.get("url")) if ld.get("url") else None
+    row["url"] = card.url if card and card.url else (ld_url or f"{origin}/en/listing/{lid}-{slug}/")
+    row["title"] = ld.get("name") or clean(P.get("title")) or (card.title if card else None)
 
     # --- type: payload slug only. Free text is never used.
-    ptype, raw_slug = normalize_type_slug(pd_.get("propertyTypeSlug"))
+    ptype, raw_slug = normalize_type_slug(pd_.get("propertyTypeSlug") if clean(pd_.get("propertyTypeSlug")) else pt.get("slug"))
     if raw_slug is None:
         ptype = type_from_title(row["title"]) if row["title"] else None
     row["property_type"], row["property_type_raw"] = ptype, raw_slug
-    row["property_type_title"] = clean(pd_.get("propertyTypeTitle"))
+    row["property_type_title"] = clean(pd_.get("propertyTypeTitle")) or clean(pt.get("title"))
 
-    # --- price
-    call_req = bool((p or {}).get("isCallRequest"))
-    pay_price = to_num(clean((p or {}).get("price"))) if p else None
+    # --- price. Payment plans are the payload's own statement of the monthly (30 d) and daily (1 d) price.
+    call_req = bool(g(P, "isCallRequest", "is_call_request"))
+    plans = [] if call_req else _plans(P)
+    pay_price = to_num(clean(P.get("price"))) if p else None
     if call_req or not pay_price:
         pay_price = None
+    ld_price = None if call_req or not ld.get("price") else float(ld["price"])
+    if ld_price is not None and pay_price is not None and abs(ld_price - float(pay_price)) > 0.5:
+        dis.append(("ld_price", pay_price, ld_price))
     c_amt = card.price_amount if card else None
-    amount = float(pay_price) if pay_price is not None else c_amt
+    amount = ld_price if ld_price is not None else (float(pay_price) if pay_price is not None else c_amt)
     period = card.price_period if card else None
+    if period is None and amount is not None:
+        for pl in plans:                                   # no card on a detail page: the plan that matches the headline
+            dur, val = to_num(pl.get("duration")), to_num(clean(pl.get("price")))
+            if val is not None and abs(float(val) - amount) < 0.5 and dur in DURATION_PERIOD:
+                period = DURATION_PERIOD[dur]
+                break
     if amount is not None and p and c_amt is not None and abs(float(pay_price or 0) - c_amt) > 0.5 and pay_price is not None:
         dis.append(("price", pay_price, c_amt))
-    mon = monthly_equiv(amount, period)
+    plan_month, plan_day = plan_price(plans, 30), plan_price(plans, 1)
+    mon = plan_month if plan_month is not None else monthly_equiv(amount, period)
+    daily = plan_day if plan_day is not None else (amount if period == "day" else (card.daily_rate if card else None))
     row.update(price_amount=amount, price_period=period, price_monthly=round(mon, 2) if mon is not None else None,
-               daily_rate=(amount if period == "day" else (card.daily_rate if card else None)),
-               is_call_request=int(call_req), currency="EGP")
+               daily_rate=daily, is_call_request=int(call_req), currency=ld.get("currency") or "EGP")
 
     # --- area
-    pay_area = to_num(clean((p or {}).get("area"))) if p else None
+    pay_area = to_num(clean(P.get("area"))) if p else None
     c_area = card.area_sqm if card else None
     if pay_area is not None and c_area is not None and abs(pay_area - c_area) > 0.5:
         dis.append(("area", pay_area, c_area))
-    row["area_sqm"] = float(pay_area) if pay_area is not None else c_area
+    ld_area = ld.get("area")
+    if ld_area is not None and pay_area is not None and abs(ld_area - pay_area) > 0.5:
+        dis.append(("ld_area", pay_area, ld_area))
+    area = ld_area if ld_area is not None else pay_area
+    row["area_sqm"] = float(area) if area is not None else c_area
 
     # --- beds / baths: residential only, raw kept
     beds_raw = clean(attrs.get("rooms")) if p else (card.beds if card else None)
     baths_raw = clean(attrs.get("baths")) if p else (card.baths if card else None)
+    if ld.get("rooms") is not None:
+        if beds_raw is not None and to_int(beds_raw) != ld["rooms"]:
+            dis.append(("ld_beds", beds_raw, ld["rooms"]))
+        beds_raw = ld["rooms"]
+    if ld.get("baths") is not None:
+        if baths_raw is not None and to_int(baths_raw) != ld["baths"]:
+            dis.append(("ld_baths", baths_raw, ld["baths"]))
+        baths_raw = ld["baths"]
     row["beds_raw"], row["baths_raw"] = (str(beds_raw) if beds_raw is not None else None,
                                         str(baths_raw) if baths_raw is not None else None)
     residential = ptype in RESIDENTIAL_TYPES
@@ -866,14 +1187,14 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
 
     row["floor"] = clean(attrs.get("floor"))
     row["finish_type"] = clean(attrs.get("finishType"))
-    yb = clean(pd_.get("yearBuilt"))
+    yb = pv("yearBuilt", "year_built")
     row["year_built"] = str(yb) if yb is not None else None
-    vc = clean(pd_.get("propertyView"))
+    vc = pv("propertyView", "property_view")
     row["view_code"] = to_int(vc) if vc is not None else None
 
     # --- location
-    loc = parse_location((p or {}).get("location"))
-    row["district"] = loc.get("district") or (card.district if card else None)
+    loc = parse_location(P.get("location"))
+    row["district"] = loc.get("district") or (card.district if card else None) or ld.get("locality")
     row["area_name"] = loc.get("area_name") or (card.area_name if card else None)
     row["district_id"], row["area_id"] = loc.get("district_id"), loc.get("area_id")
     row["area_parent_id"], row["location_slug"] = loc.get("area_parent_id"), loc.get("location_slug")
@@ -885,46 +1206,113 @@ def build_row(p: dict | None, card: Card | None, origin: str = "https://aqarmap.
     # --- advertiser: NULL = no data, never "owner"
     uid = user.get("id")
     row["advertiser_id"] = int(uid) if isinstance(uid, int) or (isinstance(uid, str) and uid.isdigit()) else None
-    row["advertiser_name"] = clean(user.get("fullName")) or (card.advertiser if card else None)
+    row["advertiser_name"] = g(user, "fullName", "full_name") or (card.advertiser if card else None)
     row["card_advertiser"] = card.advertiser if card else None
-    paid = user.get("has_active_logo_service") if p else None
+    paid = g(user, "has_active_logo_service", "hasActiveLogoService") if p else None
     row["has_paid_logo"] = int(bool(paid)) if paid is not None else (int(card.advertiser is not None) if card else None)
-    row["featured_type"] = clean((p or {}).get("featuredType"))
+    row["featured_type"] = clean(P.get("featuredType"))
     row["badges"] = card.badges if card else None
 
     # --- photos
-    pc = (p or {}).get("photosCount")
-    row["photo_count"] = to_int(pc) if pc is not None else (card.photo_count if card else None)
+    pc = g(P, "photosCount", "photos_count")
+    plist = P.get("photos") if isinstance(P.get("photos"), list) else None
+    row["photo_count"] = to_int(pc) if pc is not None else (card.photo_count if card else (len(plist) if plist else None))
     big = pd_.get("largePhotos")
     photos = [x.get("src") for x in big if isinstance(x, dict) and x.get("src")] if isinstance(big, list) else None
-    row["photos"] = json.dumps(photos) if photos else None
+    row["photos"] = json.dumps(photos) if photos else (json.dumps(ld["images"]) if ld.get("images") else None)
     row["image_url"] = card.image_url if card else None
-    row["updated_at"] = clean(pd_.get("updatedAt"))
+    row["updated_at"] = pv("updatedAt", "updated_at")
 
     # --- fields the brief hopes might exist in the payload (taken only when really present)
-    posted = _find_key(p, _POSTED_KEYS) if p else None
-    row["posted_date"] = str(posted) if posted is not None else None
-    fur = _find_key(p, _FURNISHED_KEYS) if p else None
-    row["furnished"] = ("yes" if fur in (True, 1, "1", "true", "yes") else "no") if fur is not None else None
-    lat, lng = to_num(_find_key(p, _LAT_KEYS)) if p else None, to_num(_find_key(p, _LNG_KEYS)) if p else None
+    body = {k: v for k, v in P.items() if k != "user"}       # a seller's own created_at is not the listing's posting date
+    posted = _find_key(body, _POSTED_KEYS) if p else None
+    row["posted_date"] = str(posted) if posted is not None else ld.get("date_posted_iso")
+    fur = _find_key(body, _FURNISHED_KEYS) if p else None
+    row["furnished"] = ("yes" if fur in (True, 1, "1", "true", "yes") else "no") if fur is not None else (
+        "yes" if isinstance(raw_slug, str) and raw_slug.lower().startswith("furnished-") else None)
+    lat, lng = ld.get("lat"), ld.get("lng")
+    if lat is None or lng is None:
+        lat, lng = (to_num(_find_key(body, _LAT_KEYS)), to_num(_find_key(body, _LNG_KEYS))) if p else (None, None)
     row["lat"], row["lng"] = (lat, lng) if in_bbox(lat, lng) else (None, None)
-    row["payment_method"] = to_int((p or {}).get("payment_method"))
-    row["payment_method_label"] = clean(pd_.get("paymentMethodLabel"))
-    plans = (p or {}).get("payment_plans")
-    row["payment_duration"] = to_int(plans[0].get("duration")) if isinstance(plans, list) and plans and isinstance(plans[0], dict) else None
-    row["category"] = clean((p or {}).get("category"))
+    row["payment_method"] = to_int(P.get("payment_method"))
+    row["payment_method_label"] = pv("paymentMethodLabel", "payment_method_label")
+    row["payment_duration"] = to_int(plans[0].get("duration")) if plans else None
+    row["category"] = clean(P.get("category"))
     row["has_map"] = int(bool(pd_.get("hasMap"))) if "hasMap" in pd_ else None
+
+    # --- v4: payload-sourced detail fields (results pages carry some of them too; absent keys stay NULL)
+    ar = translation(P, "ar")
+    cat_ld = ld.get("category")
+    sec_slug = clean(sec.get("slug")) or (re.search(r"/listing/\d+-(for-rent|for-sale)", row["url"] or "") or [None, None])[1] \
+        or ({"forrent": "for-rent", "forsale": "for-sale"}.get(str(cat_ld).lower()) if cat_ld else None)
+    row.update(
+        section_slug=sec_slug,
+        address=g(P, "address") or ld.get("street"),
+        description_en=g(P, "description"),
+        status=to_int(P.get("status")), status_label=pv("status_label", "statusLabel"),
+        reference_number=(str(g(P, "reference_number", "referenceNumber")) if g(P, "reference_number", "referenceNumber") is not None else None),
+        is_featured=to_flag(P.get("is_featured")), was_featured=to_flag(P.get("was_featured")),
+        is_hold=to_flag(P.get("is_hold")), accepts_messages=to_flag(P.get("accepts_messages")),
+        has_whatsapp=to_flag(P.get("has_whatsapp")),
+        video_url=g(P, "video_url", "videoUrl"), brochure=g(P, "brochure"),
+        meta_title=g(P, "meta_title", "metaTitle"), meta_description=g(P, "meta_description", "metaDescription"),
+        price_per_meter=to_num(g(P, "price_per_meter", "pricePerMeter")),
+        seller_type=to_int(g(user, "user_type", "userType")),
+        seller_active_listings=to_int(g(user, "activeListingsCount", "active_listings_count")),
+        seller_score=to_num(g(user, "score")),
+        seller_logo_url=_thumb(user.get("logo")), seller_photo_url=_thumb(user.get("personal_photo") or user.get("personalPhoto")),
+        amenities_codes=jlist(_amenity_codes(P.get("amenities"))),
+        payment_plans_json=jlist(plans),
+        translations_ar_title=clean(ar.get("title")), translations_ar_description=clean(ar.get("description")),
+        translations_ar_address=clean(ar.get("address")),
+        property_view_label=pv("property_view_label", "propertyViewLabel"),
+        property_type_amenities_json=jlist(_amenity_codes(pt.get("amenities"))),
+        # JSON-LD (detail pages)
+        date_posted_iso=ld.get("date_posted_iso"), availability=ld.get("availability"), country=ld.get("country"),
+        amenities_jsonld=jlist(ld.get("amenities")), images_jsonld=jlist(ld.get("images")),
+        category_ld=cat_ld, property_type_ld=ld.get("property_type"),
+        breadcrumb_path=jlist(crumbs), payload_kind=kind if p else None,
+    )
 
     row["card_text"] = card.card_text if card else None
     row["card_html"] = zlib.compress(card.card_html.encode("utf-8"), 6) if card else None
     row["raw_json"] = zjson(scrub_payload(p)) if p else None
+    # detail-primary rows keep their JSON-LD and breadcrumbs so `reparse` can rebuild every column offline
+    row["raw_aux_json"] = zjson(scrub_payload({"kind": "detail", "ld": ld or None, "crumbs": crumbs})) if p and kind == "detail" else None
     return row, dis
+
+
+# columns that a detail record may only fill when the existing row has NULL there (results-page data wins)
+_DETAIL_FILL_EXCLUDE = {"url", "parse_source", "card_text", "card_advertiser", "badges", "image_url", "district_url", "area_url"}
+
+
+def merge_rows(base: dict, det: dict, prefer_detail: bool = False) -> dict:
+    """Combine a results-page row with a detail-page row of the same listing. Old v3 columns: `base` wins and `det`
+    only fills NULLs (or the reverse with prefer_detail, used when the detail page was crawled on purpose to refresh
+    the record). v4 columns: a non-NULL detail value wins, because the detail page is the richer source."""
+    out = dict(base)
+    for c in (c for c in CORE_PARSE_COLS if c not in _DETAIL_FILL_EXCLUDE):
+        b, d = base.get(c), det.get(c)
+        out[c] = (d if d is not None else b) if prefer_detail else (b if b is not None else d)
+    for c in NEW_COL_NAMES:
+        if det.get(c) is not None:
+            out[c] = det[c]
+    return out
+
+
+def aux_detail_row(aux: dict | None, origin: str) -> tuple[dict | None, bool]:
+    """Stored enrichment bundle -> (detail row rebuilt from it, prefer_detail). Offline, no network."""
+    dl = (aux or {}).get("detail_listing")
+    if not dl:
+        return None, False
+    det, _ = build_row(dl, None, origin, ld=aux.get("ld"), crumbs=aux.get("crumbs"), kind="detail")
+    return det, bool(aux.get("prefer_detail"))
 
 
 @dataclass
 class PageParse:
     rows: list[dict]
-    disagreements: list[tuple]           # (listing_id, field, payload_value, card_value)
+    disagreements: list[tuple]           # (listing_id, field, payload_value, card_or_jsonld_value)
     total: int | None
     cards: list[Card]
     payload: Payload | None = None
@@ -933,18 +1321,64 @@ class PageParse:
     id_match: bool | None = None
     ld_match: bool | None = None
     notes: list[str] = field(default_factory=list)
+    kind: str = "list"                   # "list" = results page | "detail" = one listing page
+    detail_ld: dict | None = None        # detail pages: the parsed RealEstateListing JSON-LD
+    crumbs: list[str] | None = None      # detail pages: breadcrumb names
+
+
+def is_listing_url(url: str) -> bool:
+    """True for a single-listing URL (…/listing/<id>-…), false for a results URL."""
+    return bool(LISTING_HREF_RE.search(urlparse(url).path))
+
+
+def _parse_detail_page(html: str, url: str, origin: str, payload: Payload, notes: list[str]) -> PageParse:
+    ld, crumbs = extract_detail_extras(html)
+    p = payload.listings[0]
+    if ld is None:
+        notes.append("JSON-LD RealEstateListing block (#listing-details-schema) not found; using the RSC payload only")
+    elif ld.get("id") is not None and ld["id"] != p.get("id"):
+        notes.append(f"JSON-LD id {ld['id']} != payload id {p.get('id')}; ignoring the JSON-LD block")
+        ld = None
+    if crumbs is None:
+        notes.append("breadcrumb schema (#Breadcrumb-schema) not found")
+    missing = [k for k in DETAIL_HARD_KEYS if k not in p]
+    if missing:
+        notes.append("detail payload is missing keys: " + ", ".join(missing))
+    row, dis = build_row(p, None, origin, ld=ld, crumbs=crumbs, kind="detail")
+    return PageParse(rows=[row], disagreements=[(row["id"], f, a, b) for f, a, b in dis], total=1, cards=[],
+                     payload=payload, parse_source="payload", id_match=True, ld_match=None if ld is None else True,
+                     notes=notes, kind="detail", detail_ld=ld, crumbs=crumbs)
+
+
+def parse_detail_record(html: str, url: str) -> PageParse:
+    """One detail page -> a PageParse with exactly one row. Raises PayloadError when the page carries no
+    decodable listing object (callers turn that into SchemaChanged)."""
+    origin = "{0.scheme}://{0.netloc}".format(urlparse(url))
+    payload = extract_payload(html, _listing_id(url))
+    if payload.kind != "detail":
+        raise PayloadError("the page carries a results payload (initialListings), not a single listing")
+    return _parse_detail_page(html, url, origin, payload, [])
 
 
 def parse_page(html: str, url: str) -> PageParse:
-    """Pure function: one list page -> merged rows plus every cross-check result."""
+    """Pure function: one page -> merged rows plus every cross-check result. A results page yields one row per
+    card (payload first, cards cross-checked). A detail page yields one row from its payload + JSON-LD."""
     origin = "{0.scheme}://{0.netloc}".format(urlparse(url))
-    pr = parse_listing_page(html, url)
     notes: list[str] = []
     payload = None
     try:
-        payload = extract_payload(html)
+        payload = extract_payload(html, _listing_id(url) if is_listing_url(url) else None)
     except PayloadError as e:
+        if is_listing_url(url):
+            raise                        # a detail page without a decodable listing is a structure change, not a fallback case
         notes.append(f"payload unavailable: {e}")
+    if payload is not None and payload.kind == "detail" and (is_listing_url(url) or "listing-card" not in html):
+        return _parse_detail_page(html, url, origin, payload, notes)
+
+    pr = parse_listing_page(html, url)
+    if payload is not None and payload.kind != "list":
+        notes.append("page has listing cards but only a single-listing payload; ignoring the payload")
+        payload = None
     ld = extract_ld(html)
     card_ids = [c.id for c in pr.cards]
     id_match = ld_match = None
@@ -1007,6 +1441,8 @@ def schema_canary(pp: PageParse) -> list[str]:
     if pp.payload is None:
         bad.extend(pp.notes or ["payload missing"])
     else:
+        if pp.payload.kind != "list":
+            bad.append("payload is a single listing object, not the initialListings array")
         if not pp.payload.listings:
             bad.append("initialListings is empty")
         bad.extend(payload_problems(pp.payload.listings))
@@ -1017,7 +1453,55 @@ def schema_canary(pp: PageParse) -> list[str]:
     return bad
 
 
-# --------------------------------------------------------------------------- parsing: detail pages (phase 4, only for missing fields)
+def detail_canary(pp: PageParse) -> list[str]:
+    """Problems with a detail page that mean its layout changed or the record is not usable. [] = healthy."""
+    bad: list[str] = []
+    if pp.kind != "detail" or len(pp.rows) != 1:
+        return ["page did not parse into exactly one detail record"]
+    row = pp.rows[0]
+    bad.extend(n for n in pp.notes if "missing keys" in n or "JSON-LD" in n)
+    if pp.parse_source != "payload":
+        bad.append("record was not built from the embedded payload")
+    for f in ("title", "area_sqm"):
+        if row.get(f) is None:
+            bad.append(f"'{f}' is empty")
+    if row.get("price_amount") is None and not row.get("is_call_request"):
+        bad.append("no price and the listing is not 'call for price'")
+    if row.get("price_amount") is not None and row.get("price_period") is None and not row.get("price_monthly"):
+        bad.append("price found but its period could not be determined (no matching payment plan)")
+    if pp.detail_ld is not None and row.get("price_amount") and pp.detail_ld.get("price") \
+            and abs(row["price_amount"] - pp.detail_ld["price"]) > 0.5:
+        bad.append("price differs between payload and JSON-LD")
+    return bad
+
+
+def spec_checks(row: dict) -> list[tuple[str, bool]]:
+    """Structural assertions from the handoff spec's validation checklist that hold for ANY listing
+    (the id-specific values of the sample record are deliberately not hard-coded here)."""
+    def isnum(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    photos = json.loads(row["images_jsonld"]) if row.get("images_jsonld") else []
+    dp = row.get("date_posted_iso")
+    plans = json.loads(row["payment_plans_json"]) if row.get("payment_plans_json") else []
+    return [
+        ("id is an int", isinstance(row.get("id"), int)),
+        ("url contains the listing id", f"/listing/{row.get('id')}" in (row.get("url") or "")),
+        ("price positive (or call for price)", bool(row.get("is_call_request")) or (isnum(row.get("price_amount")) and row["price_amount"] > 0)),
+        ("currency set", bool(row.get("currency"))),
+        ("date_posted_iso is a tz-aware UTC timestamp", bool(dp) and dp.endswith("Z")),
+        ("lat/lng in range", row.get("lat") is None or (-90 <= row["lat"] <= 90 and -180 <= row["lng"] <= 180)),
+        ("JSON-LD images are https URLs", all(u.startswith("https://") for u in photos)),
+        ("section_slug is for-rent / for-sale", row.get("section_slug") in ("for-rent", "for-sale")),
+        ("payment plans keep durations", all("duration" in p for p in plans)),
+        ("price_monthly agrees with the 30-day plan",
+         next((float(p["price"]) for p in plans if to_num(p.get("duration")) == 30 and p.get("price")), None) in (None, row.get("price_monthly"))),
+        ("daily_rate agrees with the 1-day plan",
+         next((float(p["price"]) for p in plans if to_num(p.get("duration")) == 1 and p.get("price")), None) in (None, row.get("daily_rate"))),
+        ("no phone number stored in raw_json", not re.search(r"\+\d{6,}", json.dumps(unzjson(row["raw_json"]), ensure_ascii=False))),
+    ]
+
+
+# --------------------------------------------------------------------------- parsing: detail pages (DOM labels, fallback only)
 DETAIL_LABELS: dict[str, list[str]] = {
     "detail_posted_date": ["date posted", "posted", "posted on", "listed on", "تاريخ النشر"],
     "detail_updated_date": ["date updated", "updated", "last updated", "تاريخ التحديث"],
@@ -1031,6 +1515,9 @@ DETAIL_LABELS: dict[str, list[str]] = {
     "detail_furnished": ["furnished", "furnishing", "مفروش"],
     "detail_seller_type": ["seller type", "seller", "advertiser type", "نوع المعلن"],
     "detail_payment": ["payment method", "payment terms", "payment", "طريقة الدفع"],
+    "detail_reference": ["reference number", "reference no", "reference", "ref no", "ref", "رقم المرجع"],
+    "detail_property_type": ["property type", "type", "نوع العقار"],
+    "detail_reception": ["reception", "reception rooms", "receptions", "ريسبشن"],
 }
 _ALL_LABELS = {s for syns in DETAIL_LABELS.values() for s in syns} | {"reception", "reception rooms", "listing id", "property id"}
 _DATE_FORMATS = ("%B %d, %Y", "%b %d, %Y", "%d %B %Y", "%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y")
@@ -1088,8 +1575,9 @@ def _drop_similar_sections(doc: HTMLParser) -> None:
 
 
 def parse_detail(html: str, url: str) -> dict:
-    """Detail page -> detail_* values only. Photos are deliberately NOT read from here (the payload has them at
-    `large` size; this page also carries 'similar listings' thumbnails). 'Similar' sections are removed first."""
+    """Detail page DOM -> detail_* values only. These are FALLBACKS: payload / JSON-LD values win and detail_* only
+    fills NULLs (see load_rows). Photos are deliberately NOT read from here (the payload and JSON-LD have them; this
+    page also carries 'similar listings' thumbnails). 'Similar' sections are removed first."""
     doc = HTMLParser(html)
     out: dict = {}
     h1 = doc.css_first("h1")
@@ -1204,6 +1692,24 @@ LISTING_COLS: list[tuple[str, str]] = [
     ("detail_seller_type", "TEXT"), ("detail_payment", "TEXT"), ("detail_lat", "REAL"), ("detail_lng", "REAL"),
     ("detail_attrs_json", "TEXT"), ("detail_text", "BLOB"),
 ]
+# v4: everything the detail page adds. Payload-sourced and JSON-LD-sourced columns live side by side; results pages
+# fill the payload-sourced ones when they carry the key. Order is the order of the migration, not of the export.
+NEW_COLS_V4: list[tuple[str, str]] = [
+    ("section_slug", "TEXT"), ("address", "TEXT"), ("description_en", "TEXT"), ("status", "INTEGER"),
+    ("status_label", "TEXT"), ("reference_number", "TEXT"), ("is_featured", "INTEGER"), ("was_featured", "INTEGER"),
+    ("is_hold", "INTEGER"), ("accepts_messages", "INTEGER"), ("has_whatsapp", "INTEGER"), ("video_url", "TEXT"),
+    ("brochure", "TEXT"), ("meta_title", "TEXT"), ("meta_description", "TEXT"), ("price_per_meter", "REAL"),
+    ("seller_type", "INTEGER"), ("seller_active_listings", "INTEGER"), ("seller_score", "REAL"),
+    ("seller_logo_url", "TEXT"), ("seller_photo_url", "TEXT"), ("amenities_codes", "TEXT"),
+    ("payment_plans_json", "TEXT"), ("translations_ar_title", "TEXT"), ("translations_ar_description", "TEXT"),
+    ("translations_ar_address", "TEXT"), ("property_view_label", "TEXT"), ("property_type_amenities_json", "TEXT"),
+    ("date_posted_iso", "TEXT"), ("availability", "TEXT"), ("country", "TEXT"), ("amenities_jsonld", "TEXT"),
+    ("images_jsonld", "TEXT"), ("category_ld", "TEXT"), ("property_type_ld", "TEXT"), ("breadcrumb_path", "TEXT"),
+    ("payload_kind", "TEXT"),
+]
+NEW_COL_NAMES = [c for c, _ in NEW_COLS_V4]
+LISTING_COLS += [*NEW_COLS_V4, ("raw_aux_json", "BLOB"), ("detail_reference", "TEXT"),
+                 ("detail_property_type", "TEXT"), ("detail_reception", "TEXT")]
 OTHER_TABLES: dict[str, list[tuple[str, str]]] = {
     "price_history": [("id", "INTEGER NOT NULL"), ("seen_at", "TEXT NOT NULL"), ("price_amount", "REAL"),
                       ("price_period", "TEXT"), ("price_monthly", "REAL"), ("run_id", "INTEGER")],
@@ -1231,7 +1737,9 @@ CREATE INDEX IF NOT EXISTS idx_listings_source_run ON listings(source, last_seen
 """
 
 # columns rewritten on every sighting / reparse. Crawl-state and detail_* columns are never in this list.
-PARSE_COLS = [
+# The v3 columns are overwritten by every sighting; the v4 columns (NEW_COL_NAMES) are kept when a sighting has
+# nothing for them, and a row that has been enriched from a detail page keeps the detail values (see _upsert_sql).
+CORE_PARSE_COLS = [
     "url", "slug", "title", "property_type", "property_type_raw", "property_type_title", "price_amount",
     "price_period", "price_monthly", "daily_rate", "is_call_request", "currency", "area_sqm", "beds", "baths",
     "beds_raw", "baths_raw", "floor", "finish_type", "year_built", "view_code", "district", "area_name",
@@ -1240,7 +1748,8 @@ PARSE_COLS = [
     "photo_count", "photos", "image_url", "updated_at", "posted_date", "furnished", "lat", "lng", "payment_method",
     "payment_method_label", "payment_duration", "category", "has_map", "parse_source", "card_text",
 ]
-_BLOB_PARSE = ("card_html", "raw_json")   # kept when the new sighting has none (card-only page keeps old raw_json)
+PARSE_COLS = CORE_PARSE_COLS + NEW_COL_NAMES
+_BLOB_PARSE = ("card_html", "raw_json", "raw_aux_json")   # kept when the new sighting has none (card-only page keeps old raw_json)
 
 # v2 -> v3 explicit column renames (the v2 detail fields now live under detail_*)
 _V2_RENAMES = {
@@ -1258,7 +1767,12 @@ def _upsert_sql() -> str:
     state = ["id", "source", "page", "first_seen", "last_seen", "first_seen_run", "last_seen_run", "active",
              "missed_runs", "delisted_run"]
     cols = ["id", *PARSE_COLS, *_BLOB_PARSE, *state[1:]]
-    sets = [f"{c}=excluded.{c}" for c in PARSE_COLS]
+    sets = [f"{c}=excluded.{c}" for c in CORE_PARSE_COLS]
+    for c in NEW_COL_NAMES:
+        if c == "payload_kind":
+            sets.append("payload_kind=CASE WHEN payload_kind='detail' THEN 'detail' ELSE COALESCE(excluded.payload_kind,payload_kind) END")
+        else:   # enriched rows keep their detail values; other rows take the fresh sighting when it has one
+            sets.append(f"{c}=CASE WHEN payload_kind='detail' THEN COALESCE({c},excluded.{c}) ELSE COALESCE(excluded.{c},{c}) END")
     sets += [f"{c}=COALESCE(excluded.{c},{c})" for c in _BLOB_PARSE]
     sets += ["source=excluded.source", "page=excluded.page", "last_seen=excluded.last_seen",
              "last_seen_run=excluded.last_seen_run", "first_seen_run=COALESCE(first_seen_run,excluded.first_seen_run)",
@@ -1271,7 +1785,7 @@ UPSERT_LISTING = _upsert_sql()
 DETAIL_COLS = ["detail_full_title", "detail_posted_date", "detail_updated_date", "detail_area_sqm", "detail_beds",
                "detail_baths", "detail_floor", "detail_view", "detail_year_built", "detail_finishing",
                "detail_furnished", "detail_seller_type", "detail_payment", "detail_lat", "detail_lng",
-               "detail_attrs_json"]
+               "detail_attrs_json", "detail_reference", "detail_property_type", "detail_reception"]
 
 
 class DB:
@@ -1321,7 +1835,31 @@ class DB:
             log.warning("v2 property_type values were cleared (they came from seller-written titles). "
                         "Run a fresh `crawl` to fill them from the payload.")
 
-    MIGRATIONS = {2: _migrate_2_to_3}   # key = version being migrated FROM
+    def _migrate_3_to_4(self) -> None:
+        """v3 -> v4: the detail-page columns. Nothing existing is touched. The new columns are back-filled from the
+        payload objects already stored in raw_json (results pages carry many of the same fields)."""
+        if "listings" not in self._tables():
+            return
+        self._add_missing_columns("listings", LISTING_COLS)
+        sets = ", ".join(f"{c}=?" for c in NEW_COL_NAMES)
+        n = skipped = 0
+        for r in self.conn.execute("SELECT id, url, card_html, raw_json, raw_aux_json FROM listings "
+                                   "WHERE raw_json IS NOT NULL").fetchall():
+            try:
+                row = rebuild_from_stored(r)
+            except Exception as e:  # noqa: BLE001
+                skipped += 1
+                log.warning("v4 back-fill skipped listing %s: %s", r["id"], e)
+                continue
+            if row:
+                self.conn.execute(f"UPDATE listings SET {sets} WHERE id=?", [*[row.get(c) for c in NEW_COL_NAMES], r["id"]])
+                n += 1
+        log.info("migrated v3 -> v4: %d new columns, back-filled %d listing(s) from stored payloads%s",
+                 len(NEW_COL_NAMES), n, f" ({skipped} skipped)" if skipped else "")
+        log.warning("v4 also improves existing columns (coordinates from center_lat/center_lng, daily_rate and "
+                    "price_monthly from payment plans). Run `reparse` once (no network) to apply that to old rows.")
+
+    MIGRATIONS = {2: _migrate_2_to_3, 3: _migrate_3_to_4}   # key = version being migrated FROM
 
     def _init_schema(self) -> None:
         tables = self._tables()
@@ -1453,17 +1991,16 @@ class DB:
         ts = now_iso()
         new = 0
         for r in rows:
-            prev = self.conn.execute("SELECT id FROM listings WHERE id=?", (r["id"],)).fetchone()
+            prev = self.conn.execute("SELECT id, raw_json, raw_aux_json FROM listings WHERE id=?", (r["id"],)).fetchone()
             if prev is None:
                 new += 1
-            if r["price_amount"] is not None:
-                last = self.conn.execute("SELECT price_amount, price_period FROM price_history WHERE id=? "
-                                         "ORDER BY rowid DESC LIMIT 1", (r["id"],)).fetchone()
-                if last is None or last["price_amount"] != r["price_amount"] or last["price_period"] != r["price_period"]:
-                    self.conn.execute("INSERT INTO price_history(id,seen_at,price_amount,price_period,price_monthly,run_id) "
-                                      "VALUES(?,?,?,?,?,?)", (r["id"], ts, r["price_amount"], r["price_period"],
-                                                              r["price_monthly"], run_id))
+            self.record_price(r, ts, run_id)
             d = {c: r.get(c) for c in ["id", *PARSE_COLS, *_BLOB_PARSE]}
+            if prev is not None and prev["raw_aux_json"] and r.get("payload_kind") == "list" and r.get("raw_json"):
+                aux = unzjson(prev["raw_aux_json"]) or {}
+                if aux.get("kind") == "detail":   # a detail-primary row met by a results page: its payload becomes the enrichment
+                    d["raw_aux_json"] = zjson({"ld": aux.get("ld"), "crumbs": aux.get("crumbs"),
+                                               "detail_listing": unzjson(prev["raw_json"])})
             d.update(source=source, page=page, first_seen=ts, last_seen=ts, first_seen_run=run_id, last_seen_run=run_id,
                      active=1, missed_runs=0, delisted_run=None)
             self.conn.execute(UPSERT_LISTING, d)
@@ -1475,9 +2012,9 @@ class DB:
         return new
 
     def update_parse_cols(self, r: dict, blobs: bool = False) -> None:
-        cols = PARSE_COLS + (list(_BLOB_PARSE) if blobs else [])
-        sets = ", ".join(f"{c}=?" for c in cols)
-        self.conn.execute(f"UPDATE listings SET {sets} WHERE id=?", [*[r.get(c) for c in cols], r["id"]])
+        blob_cols = list(_BLOB_PARSE) if blobs else []   # a sighting without a blob never erases the stored one
+        sets = ", ".join([f"{c}=?" for c in PARSE_COLS] + [f"{c}=COALESCE(?,{c})" for c in blob_cols])
+        self.conn.execute(f"UPDATE listings SET {sets} WHERE id=?", [*[r.get(c) for c in PARSE_COLS + blob_cols], r["id"]])
 
     def pending_detail_ids(self, limit: int | None, retry_errors: bool, redo: bool, fields: list[str] | None) -> list[tuple[int, str]]:
         if redo:
@@ -1487,7 +2024,10 @@ class DB:
         else:
             cond = "active=1 AND detail_status IS NULL"
         miss = {"posted_date": "posted_date IS NULL", "furnished": "furnished IS NULL",
-                "coords": "lat IS NULL", "payment": "payment_method_label IS NULL AND payment_method IS NULL"}
+                "coords": "lat IS NULL", "payment": "payment_method_label IS NULL AND payment_method IS NULL",
+                "jsonld": "date_posted_iso IS NULL OR images_jsonld IS NULL",
+                "amenities": "amenities_codes IS NULL", "plans": "payment_plans_json IS NULL",
+                "translations": "translations_ar_title IS NULL AND translations_ar_description IS NULL"}
         if fields:
             cond += " AND (" + " OR ".join(miss[f] for f in fields) + ")"
         sql = f"SELECT id,url FROM listings WHERE {cond} ORDER BY id DESC"
@@ -1509,6 +2049,49 @@ class DB:
                 vals.append(d[col])
         vals.append(lid)
         self.conn.execute(f"UPDATE listings SET {', '.join(sets)} WHERE id=?", vals)
+
+    def record_price(self, r: dict, ts: str, run_id: int | None) -> None:
+        if r.get("price_amount") is None:
+            return
+        last = self.conn.execute("SELECT price_amount, price_period FROM price_history WHERE id=? "
+                                 "ORDER BY rowid DESC LIMIT 1", (r["id"],)).fetchone()
+        if last is None or last["price_amount"] != r["price_amount"] or last["price_period"] != r["price_period"]:
+            self.conn.execute("INSERT INTO price_history(id,seen_at,price_amount,price_period,price_monthly,run_id) "
+                              "VALUES(?,?,?,?,?,?)", (r["id"], ts, r["price_amount"], r["price_period"],
+                                                      r["price_monthly"], run_id))
+
+    def merge_detail_record(self, lid: int, det_row: dict, aux: dict, prefer_detail: bool = False) -> bool:
+        """Fold a detail-page row into the EXISTING row of the same listing (never a second row). Old columns are only
+        filled where NULL (or refreshed with prefer_detail); v4 columns take the detail value. The detail payload,
+        JSON-LD and breadcrumbs are kept in raw_aux_json so `reparse` can redo the merge offline."""
+        cur = self.conn.execute(f"SELECT {','.join(PARSE_COLS)}, raw_aux_json FROM listings WHERE id=?", (lid,)).fetchone()
+        if cur is None:
+            return False
+        merged = merge_rows({c: cur[c] for c in PARSE_COLS}, det_row, prefer_detail)
+        self.update_parse_cols({**merged, "id": lid})
+        new_aux = {**(unzjson(cur["raw_aux_json"]) or {}), **aux}
+        self.conn.execute("UPDATE listings SET raw_aux_json=? WHERE id=?", (zjson(scrub_payload(new_aux)), lid))
+        return True
+
+    def enrich_from_detail(self, det_row: dict, pp: PageParse, run_id: int | None, prefer_detail: bool = False) -> bool:
+        """Detail page of a listing that is already in the DB. run_id is given when the page was crawled as a source
+        (counts as a sighting); the `details` pass passes None and leaves the crawl state alone."""
+        lid = det_row["id"]
+        aux = {"ld": pp.detail_ld, "crumbs": pp.crumbs, "detail_listing": pp.payload.listings[0]}
+        if prefer_detail:
+            aux["prefer_detail"] = True
+        if not self.merge_detail_record(lid, det_row, aux, prefer_detail):
+            return False
+        if run_id is not None:
+            ts = now_iso()
+            self.record_price(det_row, ts, run_id)
+            self.conn.execute("UPDATE listings SET last_seen=?, last_seen_run=?, active=1, missed_runs=0, delisted_run=NULL "
+                              "WHERE id=?", (ts, run_id, lid))
+            self.conn.execute("DELETE FROM disagreements WHERE run_id=? AND id=?", (run_id, lid))
+            for _, f, pv, cv in pp.disagreements:
+                self.conn.execute("INSERT INTO disagreements(run_id,id,field,payload_value,card_value) VALUES(?,?,?,?,?)",
+                                  (run_id, lid, f, str(pv), str(cv)))
+        return True
 
     def stats(self) -> dict:
         q = lambda sql: self.conn.execute(sql).fetchone()[0]  # noqa: E731
@@ -1536,10 +2119,18 @@ class DB:
             "pages_error": q("SELECT COUNT(*) FROM pages WHERE status='error'"),
             "raw_pages": q("SELECT COUNT(*) FROM raw_pages"),
             "price_changes": q("SELECT COUNT(*) FROM (SELECT id FROM price_history GROUP BY id HAVING COUNT(*)>1)"),
+            "detail_payload_rows": q("SELECT COUNT(*) FROM listings WHERE payload_kind='detail'"),
+            "with_amenities": q("SELECT COUNT(*) FROM listings WHERE amenities_codes IS NOT NULL"),
+            "with_date_posted_iso": q("SELECT COUNT(*) FROM listings WHERE date_posted_iso IS NOT NULL"),
+            "with_payment_plans": q("SELECT COUNT(*) FROM listings WHERE payment_plans_json IS NOT NULL"),
         }
 
 
 # --------------------------------------------------------------------------- validation
+def _json_nonempty(v) -> bool:
+    return bool(v) and v not in ("[]", "null", "{}")
+
+
 def compute_flags(rows: list[dict]) -> dict[int, list[str]]:
     """Data-quality flags per listing id. Pure function over dict rows (see load_rows)."""
     flags: dict[int, list[str]] = {r["id"]: [] for r in rows}
@@ -1566,6 +2157,18 @@ def compute_flags(rows: list[dict]) -> dict[int, list[str]]:
             f.append("no_area")
         elif ca and da and abs(da - ca) / ca > 0.10:
             f.append("area_mismatch")
+        if not _json_nonempty(r.get("amenities_codes")):
+            f.append("no_amenities")
+        if r.get("translations_ar_title") is None and r.get("translations_ar_description") is None:
+            f.append("no_translations_ar")
+        if r.get("seller_score") is None:
+            f.append("no_seller_score")
+        if not _json_nonempty(r.get("payment_plans_json")):
+            f.append("no_payment_plans")
+        if r.get("date_posted_iso") is None and r.get("posted_date") is None and r.get("detail_posted_date") is None:
+            f.append("no_date_posted")
+        if r.get("reference_number") is None and r.get("detail_reference") is None:
+            f.append("no_reference_number")
     groups: dict = defaultdict(list)
     for r in rows:
         area = r.get("area_sqm") or r.get("detail_area_sqm")
@@ -1617,7 +2220,8 @@ def flag_counts(flags: dict[int, list[str]]) -> dict[str, int]:
     return dict(sorted(c.items(), key=lambda kv: -kv[1]))
 
 
-COVERAGE_FIELDS = ("price_monthly", "area_sqm", "beds", "baths", "floor", "finish_type", "advertiser_name", "photo_count")
+COVERAGE_FIELDS = ("price_monthly", "area_sqm", "beds", "baths", "floor", "finish_type", "advertiser_name", "photo_count",
+                   "date_posted_iso", "amenities_codes")
 
 
 def coverage_by_type(rows: list[dict]) -> dict[str, dict]:
@@ -1895,7 +2499,9 @@ def build_run_report(db: DB, run_id: int, eng: Engine | None, info: dict, site_t
     n = len(seen_rows) or 1
     cov = {f: round(100 * sum(r.get(f) is not None for r in seen_rows) / n, 2)
            for f in ("title", "price_monthly", "area_sqm", "location", "photo_count", "advertiser_name", "property_type",
-                     "advertiser_id", "finish_type", "floor", "photos", "updated_at", "posted_date", "furnished", "lat")}
+                     "advertiser_id", "finish_type", "floor", "photos", "updated_at", "posted_date", "furnished", "lat",
+                     "date_posted_iso", "amenities_codes", "seller_score", "payment_plans_json", "translations_ar_title",
+                     "reference_number", "images_jsonld", "address")}
     res = [r for r in seen_rows if r.get("property_type") in RESIDENTIAL_TYPES]
     cov["beds_residential"] = round(100 * sum(r["beds"] is not None for r in res) / len(res), 2) if res else None
     cov["baths_residential"] = round(100 * sum(r["baths"] is not None for r in res) / len(res), 2) if res else None
@@ -1943,6 +2549,8 @@ class Crawler:
         self.args = eng.args
 
     async def crawl_source(self, source: str, allow_delist: bool) -> dict:
+        if is_listing_url(source):
+            return await self._crawl_listing(source)
         run_id, resumed = self.db.begin_cycle(source, fresh=self.args.refresh)
         log.info("%s cycle (run #%d)", "resuming unfinished" if resumed else "starting new", run_id)
         try:
@@ -1952,6 +2560,71 @@ class Crawler:
             raise
         res["run_id"] = run_id
         return res
+
+    async def _crawl_listing(self, source: str) -> dict:
+        """A single-listing URL as a crawl source: one fetch, one row. A new listing is inserted from its detail page;
+        a listing the DB already knows is enriched in place (same row, same column semantics, detail data refreshes it).
+        Never delists anything on its own except a confirmed 404/410 of this very listing."""
+        db, args = self.db, self.args
+        lid = _listing_id(source)
+        run_id = db.new_run("crawl", source)
+        log.info("listing-detail run #%d: %s", run_id, source)
+        try:
+            res = await self.eng.fetch(source)
+            info = {"complete": True, "seen": 0, "delisted": 0, "page_errors": 0, "ok_pages": 0, "expected_pages": 1,
+                    "prev_complete_seen": None, "incomplete_reasons": []}
+            new = 0
+            if res.status in (404, 410):
+                db.record_page(source, 1, "empty", 0, [], f"http {res.status}")
+                info["delisted"] = db.conn.execute("UPDATE listings SET active=0, delisted_run=? WHERE id=? AND active=1",
+                                                   (run_id, lid)).rowcount
+                stopped = f"HTTP {res.status}: the listing is gone"
+            elif res.status != 200:
+                db.record_page(source, 1, "error", 0, None, f"http {res.status}")
+                info.update(complete=False, page_errors=1, incomplete_reasons=[f"HTTP {res.status}"])
+                stopped = f"HTTP {res.status}"
+            else:
+                try:
+                    pp = parse_detail_record(res.text, source)
+                except PayloadError as e:
+                    self._save_failed_sample(res.text, "canary_failed_detail.html")
+                    raise SchemaChanged(f"the detail page no longer carries a decodable listing object: {e}\n"
+                                        f"The page was saved to {args.samples_dir}/canary_failed_detail.html. "
+                                        "Nothing was written to the database.") from e
+                problems = detail_canary(pp)
+                if problems:
+                    self._save_failed_sample(res.text, "canary_failed_detail.html")
+                    raise SchemaChanged("the detail page no longer looks like what the parser expects:\n  - " +
+                                        "\n  - ".join(problems) + f"\nThe page was saved to {args.samples_dir}/"
+                                        "canary_failed_detail.html. Nothing was written to the database.")
+                for note in pp.notes:
+                    log.warning("detail page: %s", note)
+                row = pp.rows[0]
+                if args.save_raw:
+                    db.save_raw_page(source, 1, run_id, res.text)
+                if db.conn.execute("SELECT 1 FROM listings WHERE id=?", (row["id"],)).fetchone():
+                    db.enrich_from_detail(row, pp, run_id, prefer_detail=True)
+                else:
+                    new = db.upsert_rows(source, 1, pp.rows, pp.disagreements, run_id)
+                db.save_detail(row["id"], parse_detail(res.text, source))
+                db.record_page(source, 1, "ok", 1, [row["id"]], pp=pp)
+                info.update(seen=1, ok_pages=1)
+                stopped = "single listing page"
+            db.commit()
+        except BaseException as e:  # noqa: BLE001
+            db.end_run(run_id, status="interrupted", stopped_reason=type(e).__name__)
+            raise
+        db.end_run(run_id, status="finished", complete=int(info["complete"]), site_total=1, stopped_reason=stopped,
+                   seen=info["seen"], new_listings=new, stats_json=json.dumps(info))
+        report = build_run_report(db, run_id, self.eng, info, 1, stopped)
+        rpath = write_run_report(report, args.runs_dir)
+        return {"source": source, "stopped": stopped, "natural": True, "new": new, "in_db": db.count_listings(),
+                "site_total": 1, "report": report, "report_path": str(rpath), "run_id": run_id, **info}
+
+    def _save_failed_sample(self, text: str, name: str) -> None:
+        d = Path(self.args.samples_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text(text, encoding="utf-8")
 
     async def _crawl(self, source: str, run_id: int, allow_delist: bool) -> dict:
         db, args = self.db, self.args
@@ -2105,7 +2778,7 @@ class DetailRunner:
     async def run(self) -> dict:
         fields = [f for f in (self.args.fields or "").split(",") if f] or None
         todo = self.db.pending_detail_ids(self.args.limit, self.args.retry_errors, self.args.redo, fields)
-        stats = {"ok": 0, "gone": 0, "deactivated": 0, "error": 0, "todo": len(todo)}
+        stats = {"ok": 0, "gone": 0, "deactivated": 0, "error": 0, "enriched": 0, "payload_missing": 0, "todo": len(todo)}
         run_id = self.db.new_run("details", None)
         if not todo:
             self.db.end_run(run_id, status="finished", complete=1, stats_json=json.dumps(stats))
@@ -2115,11 +2788,13 @@ class DetailRunner:
             queue.put_nowait(item)
         started = time.monotonic()
         blocked: list[BlockedError] = []
+        schema_err: list[SchemaChanged] = []
         empty_streak = 0
+        payload_fail_streak = 0
         warned = False
 
         async def worker():
-            nonlocal empty_streak, warned
+            nonlocal empty_streak, warned, payload_fail_streak
             while not self.eng.stop:
                 try:
                     lid, url = queue.get_nowait()
@@ -2148,6 +2823,21 @@ class DetailRunner:
                     d = parse_detail(r.text, url)
                     self.db.save_detail(lid, d)
                     stats["ok"] += 1
+                    try:
+                        rec = parse_detail_record(r.text, url)
+                    except PayloadError as e:
+                        stats["payload_missing"] += 1
+                        payload_fail_streak += 1
+                        log.warning("detail %d: %s", lid, e)
+                        if payload_fail_streak >= 2 * MAX_PAYLOAD_FAIL_STREAK:
+                            schema_err.append(SchemaChanged(f"no decodable listing object on {payload_fail_streak} detail "
+                                                            f"pages in a row (last: {url}). The site probably changed its page structure."))
+                            self.eng.stop = True
+                            return
+                    else:
+                        payload_fail_streak = 0
+                        if rec.rows[0]["id"] == lid and self.db.enrich_from_detail(rec.rows[0], rec, None):
+                            stats["enriched"] += 1
                     mapped = any(d.get(c) is not None for c in DETAIL_LABELS)
                     empty_streak = 0 if mapped else empty_streak + 1
                     if empty_streak >= 20 and not warned:
@@ -2169,10 +2859,13 @@ class DetailRunner:
             await asyncio.gather(*[worker() for _ in range(max(1, self.args.concurrency))])
         finally:
             self.db.commit()
-            self.db.end_run(run_id, status="interrupted" if blocked else "finished", complete=0 if blocked else 1,
+            self.db.end_run(run_id, status="interrupted" if (blocked or schema_err) else "finished",
+                            complete=0 if (blocked or schema_err) else 1,
                             stats_json=json.dumps(stats))
         if blocked:
             raise blocked[0]
+        if schema_err:
+            raise schema_err[0]
         return stats
 
 
@@ -2183,65 +2876,131 @@ def detail_plan(db: DB) -> dict:
     plan = {"active_listings": act}
     for name, cond in (("posted_date", "posted_date IS NULL"), ("furnished", "furnished IS NULL"),
                        ("coordinates", "lat IS NULL"), ("payment_method", "payment_method IS NULL AND payment_method_label IS NULL"),
-                       ("year_built", "year_built IS NULL"), ("floor", "floor IS NULL")):
+                       ("year_built", "year_built IS NULL"), ("floor", "floor IS NULL"),
+                       ("date_posted_iso", "date_posted_iso IS NULL"), ("amenities", "amenities_codes IS NULL"),
+                       ("payment_plans", "payment_plans_json IS NULL"), ("images_jsonld", "images_jsonld IS NULL"),
+                       ("translations_ar", "translations_ar_title IS NULL AND translations_ar_description IS NULL"),
+                       ("reference_number", "reference_number IS NULL")):
         plan[f"missing_{name}"] = q(f"SELECT COUNT(*) FROM listings WHERE active=1 AND {cond}")
     plan["detail_ok_so_far"] = q("SELECT COUNT(*) FROM listings WHERE detail_status='ok'")
-    plan["detail_page_cost"] = "about 357 KB per page uncompressed; at 1 req/s the full pass is act seconds " \
+    plan["detail_page_cost"] = f"about 357 KB per page uncompressed; at 1 req/s the full pass is {act} seconds " \
                                f"(~{fmt_eta(act)}) and ~{act * 357 / 1024 / 1024:.1f} GB"
     return plan
 
 
 # --------------------------------------------------------------------------- export
-# (key, header, arrow type, source, meaning, how NULL is treated)
-_COLS = [
-    ("id", "ID", "int64", "payload", "Aqarmap listing id (primary key)", "never null"),
-    ("url", "URL", "string", "payload slug / card link", "Canonical listing URL", "never null"),
-    ("title", "Title", "string", "payload", "Raw seller-entered title; never used to derive the type", "no data"),
-    ("property_type", "Type", "string", "payload previewDetails.propertyTypeSlug",
-     "Canonical property type slug", "slug missing or not in the canonical set (see Flags)"),
-    ("property_type_raw", "Type (raw slug)", "string", "payload", "Slug exactly as the site sent it", "no data"),
-    ("price_monthly", "Price (EGP/month)", "float64", "payload price + card period",
-     "Listed price normalised to EGP/month (day x30, week x52/12, year /12; see Flags)", "no price, call-for-price or unknown period"),
-    ("price_amount", "Listed price", "float64", "payload price", "Price as listed, in its own period", "no price / call for price"),
-    ("price_period", "Price period", "string", "card <data> text", "month | day | week | year", "period not shown"),
-    ("daily_rate", "Daily rate (EGP)", "float64", "card", "Explicit per-day price shown on the listing", "no per-day price shown"),
-    ("area_sqm", "Area (m²)", "float64", "payload area, card fallback", "Area in square metres", "no data"),
-    ("price_per_sqm", "Price per m²", "float64", "derived", "price_monthly / area_sqm", "either input is null"),
-    ("beds", "Beds", "int64", "payload attributes.rooms", "Bedrooms, residential types only", "non-residential type, unknown type or no data"),
-    ("baths", "Baths", "int64", "payload attributes.baths", "Bathrooms, residential types only", "non-residential type, unknown type or no data"),
-    ("beds_raw", "Beds (raw)", "string", "payload", "Seller-entered rooms value for every type", "no data"),
-    ("baths_raw", "Baths (raw)", "string", "payload", "Seller-entered baths value for every type", "no data"),
-    ("floor", "Floor", "string", "payload attributes.floor, detail fallback", "Floor as entered", "no data"),
-    ("finish_type", "Finish type", "string", "payload attributes.finishType, detail fallback", "Raw enum string, e.g. SUPER_LUX", "no data"),
-    ("year_built", "Year built", "string", "payload previewDetails.yearBuilt, detail fallback", "Year built", "empty string in the payload"),
-    ("view_code", "View code", "int64", "payload previewDetails.propertyView", "Numeric view code; no mapping is assumed", "no data"),
-    ("district", "District", "string", "payload location path, card fallback", "District name", "no data"),
-    ("area_name", "Area / compound", "string", "payload location path, card fallback", "Most specific location name", "listing sits at district level"),
-    ("district_id", "District ID", "int64", "payload location.parent", "Location id of the district", "parent is a group such as 'Compounds in X'"),
-    ("area_id", "Area ID", "int64", "payload location.id", "Location id of the area", "listing sits at district level"),
-    ("advertiser_id", "Advertiser ID", "int64", "payload user.id", "Aqarmap user id of the advertiser", "no data (never means owner)"),
-    ("advertiser_name", "Advertiser", "string", "payload user.fullName, card logo fallback", "Advertiser display name", "no data (never means owner)"),
-    ("has_paid_logo", "Paid logo", "int64", "payload user.has_active_logo_service", "1 if the agency pays for the card logo", "no data"),
-    ("featured_type", "Featured type", "string", "payload featuredType", "Promotion flag, e.g. sponsored", "not promoted"),
-    ("photo_count", "Photos", "int64", "payload photosCount, card fallback", "Number of photos", "no data"),
-    ("photos", "Photo URLs", "string", "payload previewDetails.largePhotos", "JSON list of large photo URLs", "no data"),
-    ("updated_at", "Updated at", "string", "payload previewDetails.updatedAt", "Last update, ISO with offset. Not the posting date", "no data"),
-    ("posted_date", "Posted", "string", "payload if present, else detail page", "Posting date. Never filled from updated_at", "not available from any source"),
-    ("furnished", "Furnished", "string", "payload if present, else detail page", "yes / no / raw detail text", "not available from any source"),
-    ("lat", "Lat", "float64", "payload if present, else detail page", "Latitude inside the Alexandria box; shared-centroid rows dropped", "no coordinates or centroid"),
-    ("lng", "Lng", "float64", "payload if present, else detail page", "Longitude, same rules as Lat", "no coordinates or centroid"),
-    ("payment_method_label", "Payment method", "string", "payload previewDetails.paymentMethodLabel", "Raw label key", "no data"),
-    ("category", "Category", "string", "payload category", "Raw site category, meaning unconfirmed", "no data"),
-    ("detail_seller_type", "Seller type (detail)", "string", "detail page", "Detail-page seller taxonomy (e.g. Developer); differs from Advertiser", "detail page not fetched"),
-    ("parse_source", "Parsed from", "string", "crawl", "payload | card (page fell back to cards)", "never null"),
-    ("first_seen", "First seen", "string", "crawl", "UTC time of first sighting", "never null"),
-    ("last_seen", "Last seen", "string", "crawl", "UTC time of latest sighting", "never null"),
-    ("active", "Active", "bool", "crawl", "False after delisting rules or a confirmed 404/410", "never null"),
-    ("flags", "Flags", "string", "validate", "Semicolon-separated data-quality flags", "empty = no flags"),
-]
+# (key, header, arrow type, source, meaning, how NULL is treated), grouped. The group is the first column of the
+# Data dictionary sheet and the order of the groups is the column order of every export.
+_COL_SPEC: dict[str, list[tuple]] = {
+    "Identity": [
+        ("id", "ID", "int64", "payload / JSON-LD url", "Aqarmap listing id (primary key)", "never null"),
+        ("url", "URL", "string", "payload slug / card link / JSON-LD url", "Canonical listing URL", "never null"),
+        ("title", "Title", "string", "JSON-LD name, else payload", "Raw seller-entered title; never used to derive the type", "no data"),
+        ("reference_number", "Reference no.", "string", "payload reference_number, detail fallback", "Advertiser's own reference number", "not provided"),
+        ("section_slug", "Section", "string", "payload section.slug, else URL / JSON-LD category", "for-rent | for-sale", "no data"),
+        ("status", "Status code", "int64", "payload status", "Numeric listing status (2 = live on the sample; the full mapping is not published)", "no data"),
+        ("status_label", "Status label", "string", "payload status_label", "i18n key such as label.status.live; stored raw", "no data"),
+        ("category", "Category", "string", "payload category", "Raw site category code, meaning unconfirmed", "no data"),
+        ("category_ld", "Category (JSON-LD)", "string", "JSON-LD category", "ForRent | ForSale", "no JSON-LD block (results-page rows)"),
+        ("payload_kind", "Payload kind", "string", "crawl", "list = row built from a results page | detail = enriched from a detail page", "card-only row"),
+        ("parse_source", "Parsed from", "string", "crawl", "payload | card (page fell back to cards)", "never null"),
+        ("availability", "Availability", "string", "JSON-LD offers.availability", "schema.org availability with the URL prefix removed", "no JSON-LD block"),
+    ],
+    "Price": [
+        ("price_monthly", "Price (EGP/month)", "float64", "payload payment_plans (30 d), else price + period",
+         "Monthly price. The 30-day plan when the payload has one; otherwise the listed price normalised (day x30, week x52/12, year /12; see Flags)", "no price, call-for-price or unknown period"),
+        ("price_amount", "Listed price", "float64", "JSON-LD offers.price, else payload price", "Headline price in its own period", "no price / call for price"),
+        ("price_period", "Price period", "string", "card <data> text, else the matching payment plan", "month | day | week | year", "period not shown and no plan matches"),
+        ("daily_rate", "Daily rate (EGP)", "float64", "payload payment_plans (1 d), else card", "Explicit per-day price of the listing", "no per-day price shown"),
+        ("price_per_sqm", "Price per m²", "float64", "derived", "price_monthly / area_sqm", "either input is null"),
+        ("price_per_meter", "Price per meter (site)", "float64", "payload price_per_meter", "The site's own price-per-meter value (not the same as Price per m²)", "no data"),
+        ("payment_method_label", "Payment method", "string", "payload payment_method_label", "Raw i18n label key", "no data"),
+        ("payment_plans_json", "Payment plans", "string", "payload payment_plans", "JSON list of every plan: duration (days), price, deposit, down payment...", "no plans / call for price"),
+    ],
+    "Property": [
+        ("property_type", "Type", "string", "payload property_type.slug / previewDetails.propertyTypeSlug", "Canonical property type slug", "slug missing or not in the canonical set (see Flags)"),
+        ("property_type_raw", "Type (raw slug)", "string", "payload", "Slug exactly as the site sent it", "no data"),
+        ("property_type_ld", "Type (JSON-LD)", "string", "JSON-LD itemOffered.@type", "schema.org type of the offered item", "no JSON-LD block"),
+        ("area_sqm", "Area (m²)", "float64", "JSON-LD floorSize, else payload area, card, detail", "Area in square metres", "no data"),
+        ("beds", "Beds", "int64", "JSON-LD numberOfRooms / payload attributes.rooms", "Bedrooms, residential types only", "non-residential type, unknown type or no data"),
+        ("baths", "Baths", "int64", "JSON-LD numberOfBathroomsTotal / payload attributes.baths", "Bathrooms, residential types only", "non-residential type, unknown type or no data"),
+        ("beds_raw", "Beds (raw)", "string", "JSON-LD / payload", "Rooms value for every type", "no data"),
+        ("baths_raw", "Baths (raw)", "string", "JSON-LD / payload", "Baths value for every type", "no data"),
+        ("floor", "Floor", "string", "payload attributes.floor, detail fallback", "Floor as entered", "no data"),
+        ("finish_type", "Finish type", "string", "payload attributes.finish-type, detail fallback", "Raw enum string, e.g. SUPER_LUX", "no data"),
+        ("year_built", "Year built", "string", "payload, detail fallback", "Year built", "empty in the payload"),
+        ("view_code", "View code", "int64", "payload property_view", "Numeric view code; no mapping is assumed", "no data"),
+        ("property_view_label", "View label", "string", "payload property_view_label", "Raw i18n label key, e.g. label.property_view.main_street", "no data"),
+        ("furnished", "Furnished", "string", "payload flag, furnished-* type slug, else detail page", "yes / no / raw detail text", "not available from any source"),
+        ("amenities_codes", "Amenities (unit)", "string", "payload amenities", "JSON list of the amenity codes this unit actually has", "none listed"),
+        ("amenities_jsonld", "Amenities (JSON-LD)", "string", "JSON-LD amenityFeature", "JSON list of names. The site marks every allowed amenity true, so this is broader than Amenities (unit)", "no JSON-LD block"),
+        ("property_type_amenities_json", "Amenities allowed for type", "string", "payload property_type.amenities", "JSON list of every amenity the TYPE allows. Context only, never a union with the unit's amenities", "no data"),
+        ("description_en", "Description (EN)", "string", "payload description", "English description (often a template sentence)", "no data"),
+    ],
+    "Location": [
+        ("district", "District", "string", "payload location path, card / JSON-LD fallback", "District name", "no data"),
+        ("area_name", "Area / compound", "string", "payload location path, card fallback", "Most specific location name", "listing sits at district level"),
+        ("district_id", "District ID", "int64", "payload location.parent", "Location id of the district", "parent is a group such as 'Compounds in X'"),
+        ("area_id", "Area ID", "int64", "payload location.id", "Location id of the area", "listing sits at district level"),
+        ("address", "Address", "string", "payload address, else JSON-LD streetAddress", "Street address as written, comma separated", "no data"),
+        ("lat", "Lat", "float64", "JSON-LD geo, else payload center_lat / lat, else detail page", "Latitude inside the Alexandria box; shared-centroid rows dropped", "no coordinates or centroid"),
+        ("lng", "Lng", "float64", "JSON-LD geo, else payload center_lng / lng, else detail page", "Longitude, same rules as Lat", "no coordinates or centroid"),
+        ("country", "Country", "string", "JSON-LD address.addressCountry", "ISO country code", "no JSON-LD block"),
+        ("breadcrumb_path", "Breadcrumbs", "string", "Breadcrumb-schema", "JSON list of the breadcrumb names, outermost first. Not used to fill any other field", "no breadcrumb schema"),
+    ],
+    "Advertiser": [
+        ("advertiser_id", "Advertiser ID", "int64", "payload user.id", "Aqarmap user id of the advertiser (the spec's seller.id)", "no data (never means owner)"),
+        ("advertiser_name", "Advertiser", "string", "payload user.fullName / full_name, card logo fallback", "Advertiser display name (the spec's seller.full_name)", "no data (never means owner)"),
+        ("has_paid_logo", "Paid logo", "int64", "payload user.has_active_logo_service", "1 if the agency pays for the card logo", "no data"),
+        ("seller_type", "Seller type code", "int64", "payload user.user_type", "Numeric seller code (1 = agency, inferred; no mapping is published)", "no data"),
+        ("detail_seller_type", "Seller type (detail page)", "string", "detail page label", "Detail-page seller taxonomy (e.g. Developer); differs from the numeric code", "detail page not fetched or label absent"),
+        ("seller_active_listings", "Seller active listings", "int64", "payload user.activeListingsCount", "Seller's listing counter. The page's other counter (topSellerData) has different semantics and is not stored", "no data"),
+        ("seller_score", "Seller score", "float64", "payload user.score", "Seller score, not the listing's", "no score"),
+        ("seller_logo_url", "Seller logo", "string", "payload user.logo.thumbnails.large", "Logo image URL", "no logo"),
+        ("seller_photo_url", "Seller photo", "string", "payload user.personal_photo.thumbnails.large", "Personal photo URL", "no photo"),
+        ("accepts_messages", "Accepts messages", "int64", "payload accepts_messages", "1 / 0", "no data"),
+        ("has_whatsapp", "Has WhatsApp", "int64", "payload has_whatsapp", "1 / 0. The number itself is never stored", "no data"),
+    ],
+    "Promotion": [
+        ("featured_type", "Featured type", "string", "payload featuredType", "Promotion flag, e.g. sponsored", "not promoted"),
+        ("is_featured", "Is featured", "int64", "payload is_featured", "1 / 0", "no data"),
+        ("was_featured", "Was featured", "int64", "payload was_featured", "1 / 0", "no data"),
+        ("is_hold", "On hold", "int64", "payload is_hold", "1 / 0", "no data"),
+    ],
+    "Media": [
+        ("photo_count", "Photos", "int64", "payload photosCount, card / photos list fallback", "Number of photos", "no data"),
+        ("photos", "Photo URLs", "string", "payload previewDetails.largePhotos, else JSON-LD image", "JSON list of large photo URLs", "no data"),
+        ("images_jsonld", "Photo URLs (JSON-LD)", "string", "JSON-LD image", "JSON list of the full gallery (a detail page can carry more than the payload)", "no JSON-LD block"),
+        ("video_url", "Video", "string", "payload video_url", "Video URL", "no video"),
+        ("brochure", "Brochure", "string", "payload brochure", "Brochure URL", "no brochure"),
+    ],
+    "Dates": [
+        ("updated_at", "Updated at", "string", "payload updated_at", "Last update, ISO with offset. Not the posting date", "no data"),
+        ("posted_date", "Posted", "string", "payload if present, else JSON-LD datePosted, else detail page", "Posting date. Never filled from updated_at", "not available from any source"),
+        ("date_posted_iso", "Posted (ISO UTC)", "string", "JSON-LD datePosted", "ISO 8601 UTC, e.g. 2026-11-17T19:41:27Z. Kept as the site serves it, even when it lies in the future", "no JSON-LD block"),
+    ],
+    "Translations / SEO": [
+        ("translations_ar_title", "Title (AR)", "string", "payload translations[ar].title", "Arabic title", "no Arabic translation"),
+        ("translations_ar_description", "Description (AR)", "string", "payload translations[ar].description", "Arabic description; often the fuller one", "no Arabic translation"),
+        ("translations_ar_address", "Address (AR)", "string", "payload translations[ar].address", "Arabic address", "no Arabic translation"),
+        ("meta_title", "Meta title", "string", "payload meta_title", "SEO title", "not set"),
+        ("meta_description", "Meta description", "string", "payload meta_description", "SEO description", "not set"),
+    ],
+    "Crawl / flags": [
+        ("first_seen", "First seen", "string", "crawl", "UTC time of first sighting", "never null"),
+        ("last_seen", "Last seen", "string", "crawl", "UTC time of latest sighting", "never null"),
+        ("active", "Active", "bool", "crawl", "False after delisting rules or a confirmed 404/410", "never null"),
+        ("flags", "Flags", "string", "validate", "Semicolon-separated data-quality flags", "empty = no flags"),
+    ],
+}
+_COLS = [c for cols in _COL_SPEC.values() for c in cols]
+_COL_GROUP = {c[0]: grp for grp, cols in _COL_SPEC.items() for c in cols}
+_JSON_COLS = {"amenities_codes", "amenities_jsonld", "property_type_amenities_json", "payment_plans_json",
+              "images_jsonld", "breadcrumb_path"}
 EXPORT_COLUMNS = [(k, h) for k, h, *_ in _COLS]
 TEXT_COLS = {k for k, _, t, *_ in _COLS if t == "string" and k not in ("url", "photos", "first_seen", "last_seen")}
-_LOAD_COLS = [c for c, _ in LISTING_COLS if c not in ("card_html", "card_text", "raw_json", "detail_text", "detail_attrs_json")]
+_LOAD_COLS = [c for c, _ in LISTING_COLS if c not in ("card_html", "card_text", "raw_json", "raw_aux_json", "detail_text",
+                                                         "detail_attrs_json")]
 
 
 def load_rows(db: DB, with_text: bool = False) -> list[dict]:
@@ -2260,9 +3019,14 @@ def load_rows(db: DB, with_text: bool = False) -> list[dict]:
         d["flags"] = ";".join(flags[d["id"]])
         # payload / card values win; detail values only fill gaps (the raw detail_* columns stay in the DB)
         for c, dc in (("floor", "detail_floor"), ("finish_type", "detail_finishing"), ("year_built", "detail_year_built"),
-                      ("posted_date", "detail_posted_date"), ("furnished", "detail_furnished"), ("area_sqm", "detail_area_sqm")):
+                      ("posted_date", "detail_posted_date"), ("furnished", "detail_furnished"), ("area_sqm", "detail_area_sqm"),
+                      ("reference_number", "detail_reference")):
             if d.get(c) is None:
                 d[c] = d.get(dc)
+        if d.get("property_type") in RESIDENTIAL_TYPES:
+            for c, dc in (("beds", "detail_beds"), ("baths", "detail_baths")):
+                if d.get(c) is None:
+                    d[c] = d.get(dc)
         if d.get("lat") is None and "shared_coords" not in flags[d["id"]]:
             d["lat"], d["lng"] = d.get("detail_lat"), d.get("detail_lng")
         elif "shared_coords" in flags[d["id"]]:
@@ -2314,6 +3078,9 @@ def export_jsonl(rows: list[dict], path: Path):
                 o = {k: r.get(k) for k, _ in EXPORT_COLUMNS}
                 o["photos"] = r.get("photos_list")
                 o["flags"] = r.get("flags_list")
+                for jc in _JSON_COLS:                      # JSON text columns become real lists in JSONL
+                    if r.get(jc):
+                        o[jc] = json.loads(r[jc])
                 f.write(json.dumps(o, ensure_ascii=False) + "\n")
     atomic_write(path, w)
 
@@ -2335,6 +3102,10 @@ def export_xlsx(db: DB, rows: list[dict], path: Path, stats: dict, with_text: bo
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+
+    def _xl(v):   # Excel rejects control characters and cells over 32,767 characters
+        return ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v
 
     cols = EXPORT_COLUMNS + ([("detail_text", "Detail text")] if with_text else [])
     wb = Workbook()
@@ -2347,10 +3118,12 @@ def export_xlsx(db: DB, rows: list[dict], path: Path, stats: dict, with_text: bo
         cell.alignment = Alignment(vertical="center")
     idx = {c: i + 1 for i, (c, _) in enumerate(cols)}
     for r in rows:
-        ws.append([_cell(r, c) for c, _ in cols])
+        ws.append([_xl(_cell(r, c)) for c, _ in cols])
         ws.cell(row=ws.max_row, column=idx["url"]).hyperlink = r["url"]
     widths = {"id": 10, "url": 38, "title": 46, "district": 20, "area_name": 28, "advertiser_name": 22, "photos": 30,
-              "flags": 26, "detail_text": 50}
+              "flags": 26, "detail_text": 50, "description_en": 40, "translations_ar_title": 36,
+              "translations_ar_description": 44, "address": 34, "amenities_codes": 24, "amenities_jsonld": 30,
+              "payment_plans_json": 40, "images_jsonld": 30, "breadcrumb_path": 36, "date_posted_iso": 21}
     for c, i in idx.items():
         ws.column_dimensions[get_column_letter(i)].width = widths.get(c, 15)
     for c, fmt in (("price_monthly", "#,##0"), ("price_amount", "#,##0"), ("daily_rate", "#,##0"),
@@ -2391,12 +3164,12 @@ def export_xlsx(db: DB, rows: list[dict], path: Path, stats: dict, with_text: bo
     s.column_dimensions["A"].width = 28
 
     dd = wb.create_sheet("Data dictionary")
-    dd.append(["Column", "Header", "Type", "Source", "Meaning", "NULL means"])
+    dd.append(["Group", "Column", "Header", "Type", "Source", "Meaning", "NULL means"])
     for c in dd[1]:
         c.font = Font(bold=True)
     for k, h, t, src, meaning, nulls in _COLS:
-        dd.append([k, h, t, src, meaning, nulls])
-    for col, w in zip("ABCDEF", (20, 22, 9, 42, 70, 52)):
+        dd.append([_COL_GROUP[k], k, h, t, src, meaning, nulls])
+    for col, w in zip("ABCDEFG", (18, 28, 24, 9, 46, 80, 52)):
         dd.column_dimensions[col].width = w
     dd.freeze_panes = "A2"
     atomic_write(path, lambda p: wb.save(p))
@@ -2437,9 +3210,10 @@ async def cmd_crawl(args, eng: Engine) -> int:
     crawler = Crawler(eng)
     allow_delist = len(sources) == 1 and not args.url_file
     code = EXIT_OK
-    for p in range(max(1, args.passes)):
+    passes = 1 if all(is_listing_url(s) for s in sources) else max(1, args.passes)
+    for p in range(passes):
         if p:
-            log.info("=== pass %d of %d ===", p + 1, args.passes)
+            log.info("=== pass %d of %d ===", p + 1, passes)
         results = []
         for s in sources:
             log.info("crawling %s", s)
@@ -2455,7 +3229,7 @@ async def cmd_crawl(args, eng: Engine) -> int:
                 for why in r["incomplete_reasons"]:
                     log.info("  not complete: %s", why)
             # coverage advice only when the cycle actually ran to its natural end
-            if r["natural"] and r["site_total"] and r["seen"] < 0.95 * r["site_total"]:
+            if r["natural"] and r["site_total"] and r["seen"] < 0.95 * r["site_total"] and not is_listing_url(r["source"]):
                 log.warning("cycle ended naturally but saw only %d of ~%d listings (%.0f%%). Inventory shifts while crawling; "
                             "run another pass (--passes 2).", r["seen"], r["site_total"], 100 * r["seen"] / r["site_total"])
             if not r["natural"] and "pagination" in r["stopped"]:
@@ -2509,15 +3283,69 @@ async def deep_check(eng: Engine, source: str, pr1: PageParse) -> None:
         print("VERDICT: inconclusive; check the numbers above.")
 
 
+def probe_detail(pp: PageParse, r: Fetched, url: str, saved: Path) -> int:
+    """`probe` on a single-listing URL: show the one record, the JSON-LD / payload agreement and the canary."""
+    row = pp.rows[0]
+    print(f"\n=== DETAIL PAGE  {url}\nHTTP {r.status}  {len(r.text):,} bytes  saved: {saved}")
+    print(f"records: {len(pp.rows)}   parse_source: {pp.parse_source}   payload_kind: {row.get('payload_kind')}   "
+          f"JSON-LD listing: {'yes' if pp.detail_ld else 'NO'}   breadcrumbs: {len(pp.crumbs or [])}")
+    for note in pp.notes:
+        print("  note:", note)
+    problems = detail_canary(pp)
+    print("SCHEMA CANARY:", "OK" if not problems else "FAILED\n  - " + "\n  - ".join(problems))
+    print(f"payload vs JSON-LD disagreements: {len(pp.disagreements)}  {pp.disagreements[:6]}")
+    checks = spec_checks(row)
+    print("SPEC CHECKS:")
+    for name, ok in checks:
+        print(f"  [{'PASS' if ok else 'FAIL'}] {name}")
+    cols = [c for c, *_ in _COLS]
+    print("\nrecord:")
+    print(json.dumps({k: row.get(k) for k in cols if row.get(k) is not None}, ensure_ascii=False, indent=2, default=str))
+    empty = [c for c in NEW_COL_NAMES if row.get(c) is None]
+    print(f"\nv4 columns left NULL on this record ({len(empty)}): {', '.join(empty) or '-'}")
+    return EXIT_OK if not problems and all(ok for _, ok in checks) else EXIT_STRUCTURE
+
+
+def _origin_of(url: str) -> str:
+    return "{0.scheme}://{0.netloc}".format(urlparse(url))
+
+
+def rebuild_from_stored(r) -> dict | None:
+    """One listing's parsed columns, rebuilt offline from what its own row stores: raw_json (the payload object),
+    card_html and raw_aux_json (JSON-LD, breadcrumbs and, for enriched rows, the detail payload)."""
+    p = unzjson(r["raw_json"])
+    card = parse_card_fragment(zlib.decompress(r["card_html"]).decode("utf-8"), r["id"], r["url"]) if r["card_html"] else None
+    if p is None and card is None:
+        return None
+    aux = unzjson(r["raw_aux_json"]) or {}
+    origin = _origin_of(r["url"])
+    kind = aux.get("kind") or "list"
+    row, _ = build_row(p, card, origin, ld=aux.get("ld") if kind == "detail" else None,
+                       crumbs=aux.get("crumbs") if kind == "detail" else None, kind=kind)
+    det, prefer = aux_detail_row(aux, origin)
+    return merge_rows(row, det, prefer) if det else row
+
+
 async def cmd_probe(args, eng: Engine) -> int:
     source = load_sources(args)[0]
     outdir = Path(args.samples_dir)
     outdir.mkdir(parents=True, exist_ok=True)
-    await eng.ensure_robots([page_url(source, 1), page_url(source, 2)])
+    listing = is_listing_url(source)
+    await eng.ensure_robots([page_url(source, 1)] if listing else [page_url(source, 1), page_url(source, 2)])
     url = page_url(source, 1)
     r = await eng.fetch(url)
-    (outdir / "page1.html").write_text(r.text, encoding="utf-8")
-    pp = parse_page(r.text, url)
+    saved = outdir / ("detail.html" if listing else "page1.html")
+    saved.write_text(r.text, encoding="utf-8")
+    if listing and r.status != 200:
+        log.error("HTTP %d for %s", r.status, url)
+        return EXIT_ERROR
+    try:
+        pp = parse_page(r.text, url)
+    except PayloadError as e:
+        raise SchemaChanged(f"the detail page carries no decodable listing object: {e}\n"
+                            f"The page was saved to {saved}.") from e
+    if pp.kind == "detail":
+        return probe_detail(pp, r, url, saved)
     print(f"\n=== LIST PAGE  {url}\nHTTP {r.status}  {len(r.text):,} bytes  saved: {outdir / 'page1.html'}")
     print(f"site total: {pp.total}   cards: {len(pp.cards)}   payload objects: {len(pp.payload.listings) if pp.payload else 0}"
           f"   parsed from: {pp.parse_source}")
@@ -2577,41 +3405,81 @@ async def cmd_areas(args, eng: Engine) -> int:
     return EXIT_OK if found else EXIT_ERROR
 
 
+def _reparse_detail_page(db: DB, pp: PageParse) -> bool:
+    """A stored detail page -> the existing row of that listing. Detail-primary rows are rebuilt from the page itself.
+    A results-page row that was enriched from this page is rebuilt from its own stored payload and then merged again."""
+    row = pp.rows[0]
+    ex = db.conn.execute("SELECT id, url, card_html, raw_json, raw_aux_json FROM listings WHERE id=?", (row["id"],)).fetchone()
+    if ex is None:
+        return False
+    aux = unzjson(ex["raw_aux_json"]) or {}
+    base = None
+    if ex["raw_json"] is not None and aux.get("kind") != "detail":
+        base = rebuild_from_stored({**dict(ex), "raw_aux_json": None})
+    if base is None:
+        db.update_parse_cols(row, blobs=True)
+        return True
+    db.update_parse_cols({**merge_rows(base, row, bool(aux.get("prefer_detail"))), "id": row["id"]})
+    new_aux = {**aux, "ld": pp.detail_ld, "crumbs": pp.crumbs, "detail_listing": pp.payload.listings[0]}
+    db.conn.execute("UPDATE listings SET raw_aux_json=? WHERE id=?", (zjson(scrub_payload(new_aux)), row["id"]))
+    return True
+
+
 def cmd_reparse(args, db: DB) -> int:
-    """Rebuild every parsed column offline. `pages` re-reads raw_pages (HTML); `listings` rebuilds from each row's
-    stored raw_json + card_html; `details` re-maps stored detail text. Crawl-state columns are never touched."""
+    """Rebuild every parsed column offline. `pages` re-reads raw_pages (results pages and detail pages alike);
+    `listings` rebuilds each row from its stored raw_json + card_html + raw_aux_json; `details` re-maps stored detail
+    text. Crawl-state columns are never touched."""
     what = args.what
     n = 0
+    done: set[int] = set()
     pages = db.conn.execute("SELECT source, page, html FROM raw_pages ORDER BY source, page").fetchall()
     if what in ("pages", "all") and pages:
-        agree = {"pages": 0, "payload": 0, "card_fallback": 0, "disagreements": 0}
+        agree = {"pages": 0, "detail_pages": 0, "payload": 0, "card_fallback": 0, "disagreements": 0, "unparsable": 0}
         for r in pages:
             html = gzip.decompress(r["html"]).decode("utf-8")
-            pp = parse_page(html, page_url(r["source"], r["page"]))
-            for row in pp.rows:
-                if db.conn.execute("SELECT 1 FROM listings WHERE id=?", (row["id"],)).fetchone():
-                    db.update_parse_cols(row, blobs=True)
-                    n += 1
+            purl = page_url(r["source"], r["page"])
+            try:
+                pp = parse_page(html, purl)
+            except PayloadError as e:
+                agree["unparsable"] += 1
+                log.warning("stored page %s/%s no longer parses: %s", r["source"], r["page"], e)
+                continue
             agree["pages"] += 1
-            agree["payload" if pp.parse_source == "payload" else "card_fallback"] += 1
             agree["disagreements"] += len(pp.disagreements)
+            if pp.kind == "detail":
+                agree["detail_pages"] += 1
+                if _reparse_detail_page(db, pp):
+                    n += 1
+                    done.add(pp.rows[0]["id"])
+                continue
+            agree["payload" if pp.parse_source == "payload" else "card_fallback"] += 1
+            for row in pp.rows:
+                ex = db.conn.execute("SELECT raw_aux_json FROM listings WHERE id=?", (row["id"],)).fetchone()
+                if ex is None:
+                    continue
+                det, prefer = aux_detail_row(unzjson(ex["raw_aux_json"]), _origin_of(purl))
+                if det:                                    # keep what an earlier detail pass added to this row
+                    row = merge_rows(row, det, prefer)
+                db.update_parse_cols(row, blobs=True)
+                n += 1
+                done.add(row["id"])
             log.debug("page %s/%s: %s ids_match=%s ld_match=%s disagree=%d", r["source"], r["page"], pp.parse_source,
                       pp.id_match, pp.ld_match, len(pp.disagreements))
         log.info("re-parsed %d listing(s) from %d stored page(s): %s", n, agree["pages"], agree)
-    elif what in ("listings", "all", "pages", "payload", "cards"):
+    if what in ("listings", "payload", "cards") or what == "all" or (what == "pages" and not pages):
         if what == "pages":
             log.warning("no raw pages stored (crawl with --save-raw); falling back to per-listing data")
-        for r in db.conn.execute("SELECT id, url, card_html, raw_json FROM listings").fetchall():
-            payload = unzjson(r["raw_json"])
-            card = None
-            if r["card_html"]:
-                card = parse_card_fragment(zlib.decompress(r["card_html"]).decode("utf-8"), r["id"], r["url"])
-            if payload is None and card is None:
+        m = 0
+        for r in db.conn.execute("SELECT id, url, card_html, raw_json, raw_aux_json FROM listings").fetchall():
+            if r["id"] in done:
                 continue
-            row, _ = build_row(payload, card, "{0.scheme}://{0.netloc}".format(urlparse(r["url"])))
+            row = rebuild_from_stored(r)
+            if row is None:
+                continue
             db.update_parse_cols(row, blobs=False)
-            n += 1
-        log.info("re-parsed %d listing(s) from stored raw_json + card_html", n)
+            m += 1
+        n += m
+        log.info("re-parsed %d listing(s) from stored raw_json + card_html + raw_aux_json", m)
     if what in ("details", "all"):
         m = 0
         for r in db.conn.execute("SELECT id, detail_text FROM listings WHERE detail_text IS NOT NULL").fetchall():
@@ -2788,7 +3656,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("details", parents=[common], help="listing pages -> detail_* columns, only for missing fields")
     sp.add_argument("--plan", action="store_true", help="print which fields the payload left empty and the cost; fetch nothing")
-    sp.add_argument("--fields", help="only listings still missing one of: posted_date,furnished,coords,payment")
+    sp.add_argument("--fields", help="only listings still missing one of: posted_date,furnished,coords,payment,jsonld,amenities,plans,translations "
+                         "(a listing fetched by an older version needs --redo as well)")
     sp.add_argument("--limit", type=int, help="only process N listings (smoke test)")
     sp.add_argument("--retry-errors", action="store_true")
     sp.add_argument("--redo", action="store_true", help="re-fetch every active listing, even finished ones")
